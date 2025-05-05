@@ -6,29 +6,44 @@ import os # Import os for path manipulation in example
 
 # --- Import configurations from previous stages (assuming they exist) ---
 try:
-    from .stage1_data_acquisition import BATCH_SIZE, NUM_SLICES_PER_SCAN
-    # We need the feature dim from Stage 2 to initialize the aggregator correctly
-    from .stage2_vision_encoder import VisionEncoder # Import class to get dim
-    temp_vision_encoder = VisionEncoder() # Instantiate to get feature_dim
-    STAGE2_VISION_FEATURE_DIM = temp_vision_encoder.feature_dim
-    del temp_vision_encoder # Clean up temporary instance
-except ImportError:
-    warnings.warn("Could not import configurations from stage1/stage2. Using placeholder values for Stage 3.")
+    # Use absolute import if stages are in the same package, relative if scripts
+    # Assuming execution from a parent directory or package structure:
+    # from stage1_data_acquisition import BATCH_SIZE, NUM_SLICES_PER_SCAN
+    # from stage2_vision_encoder import VisionEncoder # Import class to get dim
+    # If running as standalone scripts, relative import might work if in the same folder:
+     from .stage1_data_acquisition import BATCH_SIZE, NUM_SLICES_PER_SCAN
+     # Dynamically get feature dim from Stage 2
+     from .stage2_vision_encoder import VisionEncoder # Import class to get dim
+     # Instantiate VisionEncoder to get its configured feature_dim
+     # Use try-except block in case stage2 fails or has different structure
+     try:
+         temp_vision_encoder = VisionEncoder() # Uses default config from stage2
+         STAGE2_VISION_FEATURE_DIM = temp_vision_encoder.feature_dim
+         print(f"Successfully derived VISION_FEATURE_DIM from Stage 2: {STAGE2_VISION_FEATURE_DIM}")
+         del temp_vision_encoder # Clean up temporary instance
+     except Exception as e_vis:
+         warnings.warn(f"Could not instantiate VisionEncoder from Stage 2 to get feature_dim: {e_vis}. Using placeholder value for Stage 3 VISION_FEATURE_DIM.")
+         STAGE2_VISION_FEATURE_DIM = 768 # Placeholder (e.g., ViT-Base)
+
+except ImportError as e_imp:
+    warnings.warn(f"Could not import configurations from stage1/stage2 ({e_imp}). Using placeholder values for Stage 3.")
     BATCH_SIZE = 4 # Placeholder
     NUM_SLICES_PER_SCAN = 64 # Placeholder
     STAGE2_VISION_FEATURE_DIM = 768 # Placeholder (e.g., ViT-Base)
-except Exception as e:
-     warnings.warn(f"Error importing/deriving config from stage1/stage2: {e}. Using placeholder values.")
+except Exception as e_other:
+     warnings.warn(f"Error importing/deriving config from stage1/stage2: {e_other}. Using placeholder values.")
      BATCH_SIZE = 4 # Placeholder
      NUM_SLICES_PER_SCAN = 64 # Placeholder
      STAGE2_VISION_FEATURE_DIM = 768 # Placeholder (e.g., ViT-Base)
 
 
 # --- Configuration for Stage 3 ---
+# Use the dimension derived from Stage 2
 VISION_FEATURE_DIM = STAGE2_VISION_FEATURE_DIM
 AGGREGATION_METHOD = 'mean' # Options: 'mean', 'lstm', 'gru', 'transformer'
 # Hidden dimension for RNNs or Transformer feedforward layer
 AGGREGATOR_HIDDEN_DIM = 512 # Relevant only if method is 'lstm', 'gru', or 'transformer'
+RNN_BIDIRECTIONAL = False # Set to True to use bidirectional RNNs
 TRANSFORMER_NHEAD = 8 # Number of attention heads for Transformer method
 TRANSFORMER_NLAYERS = 1 # Number of layers for Transformer method
 TRANSFORMER_DROPOUT = 0.1 # Dropout for transformer layers
@@ -40,25 +55,52 @@ class SliceAggregator(nn.Module):
     Supports mean pooling, LSTM, GRU, or Transformer Encoder aggregation.
     """
     def __init__(self, input_dim=VISION_FEATURE_DIM, method=AGGREGATION_METHOD,
-                 hidden_dim=AGGREGATOR_HIDDEN_DIM, nhead=TRANSFORMER_NHEAD,
-                 nlayers=TRANSFORMER_NLAYERS, dropout=TRANSFORMER_DROPOUT):
+                 hidden_dim=AGGREGATOR_HIDDEN_DIM, rnn_bidirectional=RNN_BIDIRECTIONAL,
+                 nhead=TRANSFORMER_NHEAD, nlayers=TRANSFORMER_NLAYERS, dropout=TRANSFORMER_DROPOUT):
         super().__init__()
         self.input_dim = input_dim
         self.method = method
         self.hidden_dim = hidden_dim
+        self.rnn_bidirectional = rnn_bidirectional
 
         if self.method == 'mean':
             self.aggregator = None # Mean pooling is parameter-free
             self.output_dim = self.input_dim
         elif self.method == 'lstm':
             # batch_first=True expects input shape (Batch, Seq, Feature)
-            self.aggregator = nn.LSTM(input_dim, hidden_dim, batch_first=True, bidirectional=False) # Or bidirectional=True
-            self.output_dim = hidden_dim * (2 if self.aggregator.bidirectional else 1)
+            self.aggregator = nn.LSTM(
+                input_dim,
+                hidden_dim,
+                batch_first=True,
+                bidirectional=self.rnn_bidirectional
+            )
+            self.output_dim = hidden_dim * (2 if self.rnn_bidirectional else 1)
         elif self.method == 'gru':
-            self.aggregator = nn.GRU(input_dim, hidden_dim, batch_first=True, bidirectional=False) # Or bidirectional=True
-            self.output_dim = hidden_dim * (2 if self.aggregator.bidirectional else 1)
+            self.aggregator = nn.GRU(
+                input_dim,
+                hidden_dim,
+                batch_first=True,
+                bidirectional=self.rnn_bidirectional
+            )
+            self.output_dim = hidden_dim * (2 if self.rnn_bidirectional else 1)
         elif self.method == 'transformer':
             # A simple Transformer Encoder stack
+            # Ensure input_dim is divisible by nhead
+            if input_dim % nhead != 0:
+                # Find the nearest valid head count or adjust input_dim if possible
+                # For now, we raise an error or warning
+                warnings.warn(f"input_dim ({input_dim}) is not divisible by nhead ({nhead}). Transformer may fail or perform poorly. Adjust config.")
+                # Simple fix: adjust nhead down if possible
+                valid_nhead = nhead
+                while input_dim % valid_nhead != 0 and valid_nhead > 1:
+                    valid_nhead -= 1
+                if input_dim % valid_nhead == 0:
+                     warnings.warn(f"Adjusting nhead to {valid_nhead} for compatibility.")
+                     nhead = valid_nhead
+                else:
+                     raise ValueError(f"Cannot find valid nhead for input_dim {input_dim}. Original nhead was {nhead}.")
+
+
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=input_dim,
                 nhead=nhead,
@@ -89,6 +131,9 @@ class SliceAggregator(nn.Module):
             scan_embedding = slice_features.mean(dim=1) # Shape: (BatchSize, FeatureDimension)
         elif isinstance(self.aggregator, (nn.LSTM, nn.GRU)):
             # Pass features through RNN
+            # outputs shape: (Batch, Seq, NumDirections * HiddenSize)
+            # hidden shape: (NumLayers * NumDirections, Batch, HiddenSize) for GRU
+            # hidden shape: tuple ((h_n, c_n)) for LSTM, each (NumLayers * NumDirections, Batch, HiddenSize)
             outputs, hidden = self.aggregator(slice_features)
 
             # Extract the final hidden state (last layer's hidden state)
@@ -98,13 +143,14 @@ class SliceAggregator(nn.Module):
                 h_n = hidden # Shape: (NumLayers * NumDirections, Batch, HiddenSize)
 
             # Handle bidirectionality
-            if self.aggregator.bidirectional:
+            if self.rnn_bidirectional:
                  # Concatenate final forward and backward hidden states from the last layer
-                 # hidden has shape (num_layers * num_directions, batch, hidden_size)
+                 # hidden has shape (num_layers * 2, batch, hidden_size)
                  # Last layer forward: index -2, Last layer backward: index -1
                  scan_embedding = torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1) # Shape: (Batch, HiddenDim*2)
             else:
                  # Take the hidden state of the last layer [-1]
+                 # hidden has shape (num_layers, batch, hidden_size)
                  scan_embedding = h_n[-1] # Shape: (Batch, HiddenDim)
 
         elif isinstance(self.aggregator, nn.TransformerEncoder):
@@ -138,16 +184,41 @@ try:
         input_dim=VISION_FEATURE_DIM,
         method=AGGREGATION_METHOD,
         hidden_dim=AGGREGATOR_HIDDEN_DIM,
+        rnn_bidirectional=RNN_BIDIRECTIONAL,
         nhead=TRANSFORMER_NHEAD,
         nlayers=TRANSFORMER_NLAYERS,
         dropout=TRANSFORMER_DROPOUT
     )
     AGGREGATOR_OUTPUT_DIM = temp_aggregator.output_dim
-    print(f"Stage 3 Aggregator Output Dimension: {AGGREGATOR_OUTPUT_DIM}")
+    print(f"Stage 3 Aggregator Output Dimension determined: {AGGREGATOR_OUTPUT_DIM}")
     del temp_aggregator # Clean up
+except ValueError as e_val: # Catch specific errors like nhead incompatibility
+     warnings.warn(f"Could not determine AGGREGATOR_OUTPUT_DIM due to configuration error: {e_val}. Using fallback logic.")
+     # Fallback logic based on method
+     if AGGREGATION_METHOD == 'mean':
+         AGGREGATOR_OUTPUT_DIM = VISION_FEATURE_DIM
+     elif AGGREGATION_METHOD in ['lstm', 'gru']:
+         AGGREGATOR_OUTPUT_DIM = AGGREGATOR_HIDDEN_DIM * (2 if RNN_BIDIRECTIONAL else 1)
+     elif AGGREGATION_METHOD == 'transformer':
+         AGGREGATOR_OUTPUT_DIM = VISION_FEATURE_DIM
+     else:
+         AGGREGATOR_OUTPUT_DIM = VISION_FEATURE_DIM # Default fallback
+         warnings.warn(f"Unknown aggregation method '{AGGREGATION_METHOD}'. Defaulting AGGREGATOR_OUTPUT_DIM to VISION_FEATURE_DIM ({VISION_FEATURE_DIM}).")
+     print(f"Stage 3 Aggregator Output Dimension (fallback): {AGGREGATOR_OUTPUT_DIM}")
+
 except Exception as e:
-     warnings.warn(f"Could not determine AGGREGATOR_OUTPUT_DIM dynamically: {e}. Using placeholder.")
-     AGGREGATOR_OUTPUT_DIM = AGGREGATOR_HIDDEN_DIM if AGGREGATION_METHOD in ['lstm', 'gru'] else VISION_FEATURE_DIM
+     warnings.warn(f"Could not determine AGGREGATOR_OUTPUT_DIM dynamically: {e}. Using fallback logic.")
+     # Fallback logic based on method
+     if AGGREGATION_METHOD == 'mean':
+         AGGREGATOR_OUTPUT_DIM = VISION_FEATURE_DIM
+     elif AGGREGATION_METHOD in ['lstm', 'gru']:
+         AGGREGATOR_OUTPUT_DIM = AGGREGATOR_HIDDEN_DIM * (2 if RNN_BIDIRECTIONAL else 1)
+     elif AGGREGATION_METHOD == 'transformer':
+         AGGREGATOR_OUTPUT_DIM = VISION_FEATURE_DIM
+     else:
+         AGGREGATOR_OUTPUT_DIM = VISION_FEATURE_DIM # Default fallback
+         warnings.warn(f"Unknown aggregation method '{AGGREGATION_METHOD}'. Defaulting AGGREGATOR_OUTPUT_DIM to VISION_FEATURE_DIM ({VISION_FEATURE_DIM}).")
+     print(f"Stage 3 Aggregator Output Dimension (fallback): {AGGREGATOR_OUTPUT_DIM}")
 
 
 # --- Example Usage ---
@@ -156,15 +227,18 @@ if __name__ == "__main__": # Ensures this runs only when script is executed dire
 
     # Assume slice_embeddings from Stage 2 exists (B, N, FeatureDim)
     # Create dummy data using the potentially imported or placeholder values
+    # Use VISION_FEATURE_DIM which was derived or set as placeholder
     dummy_slice_embeddings = torch.randn(BATCH_SIZE, NUM_SLICES_PER_SCAN, VISION_FEATURE_DIM)
 
     # Instantiate the aggregator
     try:
         # Try different methods by changing AGGREGATION_METHOD: 'mean', 'lstm', 'gru', 'transformer'
+        # Pass all relevant config values
         slice_aggregator = SliceAggregator(
             input_dim=VISION_FEATURE_DIM,
             method=AGGREGATION_METHOD,
             hidden_dim=AGGREGATOR_HIDDEN_DIM,
+            rnn_bidirectional=RNN_BIDIRECTIONAL,
             nhead=TRANSFORMER_NHEAD,
             nlayers=TRANSFORMER_NLAYERS,
             dropout=TRANSFORMER_DROPOUT
@@ -187,6 +261,8 @@ if __name__ == "__main__": # Ensures this runs only when script is executed dire
         # Use the dynamically determined output dim for assertion
         assert scan_level_embedding.shape[1] == AGGREGATOR_OUTPUT_DIM
 
+    except ImportError as ie:
+         print(f"\nImportError: {ie}. Make sure necessary libraries (torch) are installed and previous stages are accessible.")
     except Exception as e:
         print(f"\nError during slice aggregator test: {e}")
         import traceback
