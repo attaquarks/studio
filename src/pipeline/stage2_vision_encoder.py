@@ -1,185 +1,143 @@
 # ========== Stage 2: Vision Encoder – Feature Extraction ==========
 import torch
 import torch.nn as nn
-import timm # Or use transformers library
+import timm
 import warnings
 import os
-# from transformers import AutoModel
 
 # --- Import configurations from Stage 1 ---
 try:
-    # Use absolute import if stages are in the same package, relative if scripts
-    # Assuming execution from a parent directory or package structure:
-    # from stage1_data_acquisition import IMG_SIZE, NUM_SLICES_PER_SCAN, BATCH_SIZE
-    # If running as standalone scripts, relative import might work if in the same folder:
-     from .stage1_data_acquisition import IMG_SIZE, NUM_SLICES_PER_SCAN, BATCH_SIZE
+    from .stage1_data_acquisition import TARGET_SIZE, BATCH_SIZE, NUM_SLICES_PER_SCAN
+    IMG_SIZE = TARGET_SIZE[0] # Use the first dimension of target size
 except ImportError:
     warnings.warn("Could not import configurations from stage1_data_acquisition. Using placeholder values for Stage 2.")
-    IMG_SIZE = 224 # Placeholder
-    NUM_SLICES_PER_SCAN = 64 # Placeholder
-    BATCH_SIZE = 4 # Placeholder
+    TARGET_SIZE = (224, 224)
+    IMG_SIZE = 224
+    BATCH_SIZE = 4
+    NUM_SLICES_PER_SCAN = 64
 
-
-# --- Configuration ---
-VISION_MODEL_NAME = 'vit_base_patch16_224' # timm model name (e.g., ViT-Base)
-# VISION_MODEL_NAME = 'google/vit-base-patch16-224-in21k' # HuggingFace model name
+# --- Configuration for Stage 2 ---
+VISION_MODEL_NAME = 'vit_base_patch16_224' # timm model name
 PRETRAINED = True
-FEATURE_EXTRACTION_METHOD = 'cls' # 'cls' or 'avg' pooling
+FREEZE_BACKBONE = False # Whether to freeze the backbone during training
 
 # --- Vision Encoder Class ---
 class VisionEncoder(nn.Module):
-    """
-    Encodes batches of image slices using a pre-trained vision model (e.g., ViT).
-    Exposes the feature dimension via `self.feature_dim`.
-    """
-    def __init__(self, model_name=VISION_MODEL_NAME, pretrained=PRETRAINED,
-                 feature_extraction_method=FEATURE_EXTRACTION_METHOD):
+    """Vision encoder based on Vision Transformers for MRI feature extraction."""
+
+    def __init__(self,
+                 model_name: str = VISION_MODEL_NAME,
+                 pretrained: bool = PRETRAINED,
+                 freeze_backbone: bool = FREEZE_BACKBONE):
+        """
+        Initialize the vision encoder.
+
+        Args:
+            model_name: Name of the vision transformer model
+            pretrained: Whether to use pretrained weights
+            freeze_backbone: Whether to freeze the backbone
+        """
         super().__init__()
         self.model_name = model_name
         self.pretrained = pretrained
-        self.feature_extraction_method = feature_extraction_method
+        self.freeze_backbone = freeze_backbone
 
-        # Load the pre-trained vision model (using timm here)
+        # Load ViT model from timm
         try:
-            self.model = timm.create_model(self.model_name, pretrained=self.pretrained)
-            # Remove the final classification layer to get features
-            # Check if model has 'head' or 'fc' or similar classifier attribute
-            if hasattr(self.model, 'head'):
-                self.feature_dim = self.model.head.in_features # Get input features dim of the classifier head
-                self.model.head = nn.Identity() # Replace head with identity layer
-            elif hasattr(self.model, 'fc'): # Common in ResNets etc.
-                self.feature_dim = self.model.fc.in_features
-                self.model.fc = nn.Identity()
-            elif hasattr(self.model, 'classifier'): # Some models use 'classifier'
-                 self.feature_dim = self.model.classifier.in_features
-                 self.model.classifier = nn.Identity()
-            else:
-                 # Fallback for ViT if no head attribute - get from final block or norm layer output
-                 # This might require inspecting the specific timm model structure
-                 if hasattr(self.model, 'norm') and hasattr(self.model.norm, 'normalized_shape'):
-                      # Check if normalized_shape is an iterable (like tuple/list) or int
-                      norm_shape = self.model.norm.normalized_shape
-                      if isinstance(norm_shape, (list, tuple)) and len(norm_shape) > 0:
-                           self.feature_dim = norm_shape[0]
-                      elif isinstance(norm_shape, int):
-                           self.feature_dim = norm_shape
-                      else:
-                           # Attempt inference through a dummy forward pass if structure is unknown
-                           warnings.warn(f"Could not determine feature dim from norm layer shape ({norm_shape}). Attempting dummy forward pass.")
-                           try:
-                                dummy_input = torch.randn(1, 3, IMG_SIZE, IMG_SIZE) # Use IMG_SIZE from config
-                                # Try forward_features first
-                                if hasattr(self.model, 'forward_features'):
-                                     dummy_output = self.model.forward_features(dummy_input)
-                                else: # Fallback to full forward
-                                     dummy_output = self.model(dummy_input)
-
-                                if len(dummy_output.shape) == 3: # ViT-like (B, SeqLen, D)
-                                     self.feature_dim = dummy_output.shape[-1]
-                                elif len(dummy_output.shape) == 2: # Possibly already pooled (B, D)
-                                     self.feature_dim = dummy_output.shape[-1]
-                                else: # Likely CNN features (B, D, H', W') - not directly usable here
-                                     raise ValueError("Dummy forward pass output shape not recognized for dim inference.")
-                                print(f"Inferred feature_dim via dummy forward pass: {self.feature_dim}")
-                           except Exception as e_dummy:
-                                warnings.warn(f"Dummy forward pass failed ({e_dummy}). Assuming feature_dim=768. Check model structure.")
-                                self.feature_dim = 768 # Default fallback
-                 else:
-                      # Last resort: try to infer from a known common dimension (less robust)
-                      warnings.warn(f"Could not automatically determine feature dim for {self.model_name}. Assuming 768. Check model structure.")
-                      self.feature_dim = 768 # Common ViT-Base dim, adjust if needed
-
+            # num_classes=0 removes the final classification head
+            self.backbone = timm.create_model(
+                model_name,
+                pretrained=pretrained,
+                num_classes=0
+            )
+            # Get feature dimension from the loaded backbone
+            self.feature_dim = self.backbone.num_features
             print(f"Loaded timm model '{self.model_name}' with feature dimension {self.feature_dim}.")
 
-            # Example using HuggingFace Transformers (uncomment if preferred)
-            # from transformers import AutoModel
-            # self.model = AutoModel.from_pretrained(self.model_name)
-            # self.feature_dim = self.model.config.hidden_size
-            # # HF models usually don't need head removal for feature extraction with AutoModel
-            # print(f"Loaded HuggingFace model '{self.model_name}' with feature dimension {self.feature_dim}.")
-
-        except ImportError:
-             raise RuntimeError("HuggingFace Transformers library not found. Install it with: pip install transformers")
         except Exception as e:
-            raise RuntimeError(f"Failed to load vision model '{self.model_name}': {e}")
+            raise RuntimeError(f"Failed to load vision model '{self.model_name}' using timm: {e}")
 
+        # Freeze backbone if specified
+        if freeze_backbone:
+            print(f"Freezing backbone parameters for {self.model_name}.")
+            for param in self.backbone.parameters():
+                param.requires_grad = False
 
-    def forward(self, slices_batch):
+    def forward(self, x):
         """
+        Forward pass through the vision encoder.
+
         Args:
-            slices_batch (torch.Tensor): Input tensor of shape (BatchSize, NumSlices, Channels, Height, Width)
+            x: Input tensor of shape [B, S, C, H, W]
+                B = batch size, S = number of slices, C = channels, H = height, W = width
+               Expected C=3 for standard ViT models.
+
         Returns:
-            torch.Tensor: Slice features tensor of shape (BatchSize, NumSlices, FeatureDimension)
+            Feature tensor of shape [B, S, D] where D is the feature dimension
         """
-        batch_size, num_slices, C, H, W = slices_batch.shape
-        # Reshape for model input: Treat slices as batch items
-        # Input shape expected by ViT: (BatchSize * NumSlices, Channels, Height, Width)
-        slices_batch = slices_batch.view(batch_size * num_slices, C, H, W)
+        batch_size, num_slices, C, H, W = x.shape
 
-        # --- Feature Extraction ---
-        # Pass the reshaped batch through the vision model
+        # Input validation
+        if C != 3:
+             warnings.warn(f"Input tensor has {C} channels, but ViT model {self.model_name} typically expects 3 channels. Ensure data preprocessing aligns.")
+             # Attempt to proceed, but results might be suboptimal. Consider repeating channels in Stage 1 if needed.
 
-        # Example for timm models (common interface):
-        # Using model directly often gives classification output. Use specific feature methods if available.
-        # `forward_features` is common in many timm models including ViT.
-        if hasattr(self.model, 'forward_features'):
-             features = self.model.forward_features(slices_batch)
-        # elif hasattr(self.model, 'extract_features'): # Some models might use this
-        #     features = self.model.extract_features(slices_batch)
-        else:
-             # Fallback: Use the full forward pass and hope the Identity layer works
-             # This might return different things depending on the model structure before the head
-             warnings.warn(f"Model {self.model_name} has no 'forward_features'. Using full forward pass. Output interpretation might be incorrect.")
-             features = self.model(slices_batch) # Output shape might vary
+        # Reshape to process all slices as a single batch for the backbone
+        # Input shape expected by backbone: [B*S, C, H, W]
+        x = x.view(batch_size * num_slices, C, H, W)
 
-        # features shape for ViT is typically (BatchSize * NumSlices, NumTokens + 1, FeatureDimension)
-        # For CNNs, it might be (BatchSize*NumSlices, FeatureDim, H', W') after avgpool layer removed
+        # Extract features using the backbone
+        # timm models with num_classes=0 usually output features directly
+        # For ViT, this is often the [CLS] token or average pooled features depending on model config
+        # Let's assume it outputs [B*S, D] directly after pooling/CLS token extraction within the backbone
+        # If backbone outputs sequence (B*S, SeqLen, D), need to pool here. Check timm docs for specific model.
+        try:
+            features = self.backbone(x) # Shape should be [B*S, D]
+        except Exception as e:
+             print(f"Error during backbone forward pass: {e}")
+             # Return dummy tensor of expected shape on error
+             return torch.zeros(batch_size, num_slices, self.feature_dim, device=x.device)
 
-        # --- Select Feature Representation ---
-        # This part depends heavily on the output shape of `features`
 
-        if len(features.shape) == 4: # Likely CNN features (B*N, D, H', W')
-             # Apply global average pooling
-             slice_features = torch.mean(features, dim=[2, 3]) # Shape: (B*N, D)
-             self.feature_extraction_method = 'avg_cnn' # Indicate how features were derived
-             print("Detected CNN-like features, applied global average pooling.")
-
-        elif len(features.shape) == 3: # Likely Transformer/ViT features (B*N, SeqLen, D)
-            if self.feature_extraction_method == 'cls':
-                 # The [CLS] token embedding is usually the first one
-                 slice_features = features[:, 0] # Shape: (BatchSize * NumSlices, FeatureDimension)
-            elif self.feature_extraction_method == 'avg':
-                 # Average pooling over patch embeddings (excluding the [CLS] token)
-                 # Assumes CLS token is present at index 0
-                 slice_features = features[:, 1:, :].mean(dim=1) # Shape: (BatchSize * NumSlices, FeatureDimension)
+        # Validate output shape from backbone
+        expected_shape_part = (batch_size * num_slices, self.feature_dim)
+        if features.shape != expected_shape_part:
+            warnings.warn(f"Unexpected feature shape from backbone {self.model_name}: got {features.shape}, expected ~{expected_shape_part}. Attempting fallback pooling if sequence output detected.")
+            # Fallback: If output is sequence (e.g., ViT without final pool), pool it.
+            if len(features.shape) == 3 and features.shape[0] == batch_size * num_slices: # Shape (B*S, SeqLen, D)
+                # Example: Average pool sequence features (excluding CLS if present at index 0)
+                # This assumes CLS token is present and we want avg pool of patch tokens
+                if features.shape[1] > 1: # Check if there are patch tokens
+                    features = features[:, 1:, :].mean(dim=1) # Avg pool patches
+                else: # If only CLS token is output? Or seq len 1? Use it directly.
+                    features = features[:, 0, :] # Take the first token
+                print("Applied fallback average pooling to sequence output.")
+                # Re-check shape after fallback pooling
+                if features.shape != expected_shape_part:
+                     raise RuntimeError(f"Feature shape still incorrect ({features.shape}) after fallback pooling.")
             else:
-                 raise ValueError(f"Unsupported feature_extraction_method for Transformer/ViT: {self.feature_extraction_method}")
-        elif len(features.shape) == 2: # Features might already be pooled (B*N, D)
-             slice_features = features
-             print("Features seem to be already pooled.")
-        else:
-             raise ValueError(f"Unexpected feature shape from model: {features.shape}")
+                # Cannot resolve shape mismatch
+                raise RuntimeError(f"Cannot handle backbone output shape: {features.shape}")
 
 
-        # Reshape back to (BatchSize, NumSlices, FeatureDimension)
-        slice_features = slice_features.view(batch_size, num_slices, self.feature_dim)
+        # Reshape back to separate batch and slice dimensions
+        # Target shape: [B, S, D]
+        features = features.view(batch_size, num_slices, self.feature_dim)
 
-        return slice_features
+        return features
 
 # --- Example Usage ---
-if __name__ == "__main__": # Ensures this runs only when script is executed directly
+if __name__ == "__main__":
     print("--- Stage 2 Example ---")
-    # Assume sample_batch from Stage 1 exists and contains 'pixel_values'
-    # Or create dummy data:
-    # Make sure dummy data uses the imported config values
-    dummy_pixel_values = torch.randn(BATCH_SIZE, NUM_SLICES_PER_SCAN, 3, IMG_SIZE, IMG_SIZE) # B, N, C, H, W
+    # Create dummy input data consistent with Stage 1 output
+    dummy_pixel_values = torch.randn(BATCH_SIZE, NUM_SLICES_PER_SCAN, 3, IMG_SIZE, IMG_SIZE) # B, S, C, H, W
 
     # Instantiate the encoder
     try:
         vision_encoder = VisionEncoder(
             model_name=VISION_MODEL_NAME,
             pretrained=PRETRAINED,
-            feature_extraction_method=FEATURE_EXTRACTION_METHOD
+            freeze_backbone=FREEZE_BACKBONE
         )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         vision_encoder.to(device)
@@ -187,23 +145,33 @@ if __name__ == "__main__": # Ensures this runs only when script is executed dire
         print(f"Running example on device: {device}")
         print(f"Input dummy pixel values shape: {dummy_pixel_values.shape}")
 
-
         # Perform feature extraction
-        vision_encoder.eval() # Set to evaluation mode for inference
-        with torch.no_grad(): # Disable gradient calculation for inference
-            slice_embeddings = vision_encoder(dummy_pixel_values)
+        vision_encoder.eval() # Set to evaluation mode
+        with torch.no_grad():
+            slice_features = vision_encoder(dummy_pixel_values)
 
-        print(f"Vision encoder output shape: {slice_embeddings.shape}")
-        # Expected: (BatchSize, NumSlices, FeatureDimension)
-        assert slice_embeddings.shape[0] == BATCH_SIZE
-        assert slice_embeddings.shape[1] == NUM_SLICES_PER_SCAN
-        assert slice_embeddings.shape[2] == vision_encoder.feature_dim # Check against instance attribute
+        print(f"Vision encoder output shape: {slice_features.shape}") # Expected: (B, S, D)
+        # Check dimensions
+        assert slice_features.shape[0] == BATCH_SIZE
+        assert slice_features.shape[1] == NUM_SLICES_PER_SCAN
+        assert slice_features.shape[2] == vision_encoder.feature_dim
 
     except ImportError as ie:
-         print(f"\nImportError: {ie}. Make sure necessary libraries (torch, timm) are installed.")
+        print(f"\nImportError: {ie}. Make sure 'timm' is installed (pip install timm).")
     except Exception as e:
-        print(f"\nError during vision encoder test: {e}")
+        print(f"\nError during vision encoder example: {e}")
         import traceback
         traceback.print_exc()
 
     print("\nStage 2: Vision feature extraction setup complete.\n")
+
+# Export the feature dimension for subsequent stages
+# Instantiate once to get the dimension
+try:
+    _temp_encoder = VisionEncoder()
+    VISION_FEATURE_DIM = _temp_encoder.feature_dim
+    print(f"Stage 2 VISION_FEATURE_DIM determined: {VISION_FEATURE_DIM}")
+    del _temp_encoder
+except Exception as e:
+    warnings.warn(f"Could not determine VISION_FEATURE_DIM dynamically: {e}. Using placeholder 768.")
+    VISION_FEATURE_DIM = 768 # Fallback (e.g., ViT-Base)
