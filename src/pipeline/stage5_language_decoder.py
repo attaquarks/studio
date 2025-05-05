@@ -53,7 +53,8 @@ LORA_DROPOUT = 0.05
 # Common names for T5: ["q", "v"]
 # Common names for OPT/GPT/BioGPT: ["q_proj", "v_proj"]
 # Common names for Llama/Falcon: ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"] (check specific variant)
-LORA_TARGET_MODULES = ["q", "v"] # Example for T5, adjust as needed!
+# Initialize with None or empty list, will be determined heuristically or requires manual setting
+LORA_TARGET_MODULES = None # Example: ["q", "v"] for T5. If None, will try to infer.
 
 # Generation parameters
 MAX_GENERATION_LENGTH = 128 # Max *new* tokens for generated output
@@ -78,15 +79,21 @@ def get_gpu_memory():
             # free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info()
             # return free_mem_bytes / (1024**3)
             # Fallback 2: Get total and allocated, calculate free
-            total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            allocated_mem = torch.cuda.memory_allocated(0) / (1024**3)
-            return total_mem - allocated_mem # Approximation
+            try:
+                total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                allocated_mem = torch.cuda.memory_allocated(0) / (1024**3)
+                return total_mem - allocated_mem # Approximation
+            except Exception:
+                return 0 # If CUDA properties fail
     else:
         return 0
 
 def get_cpu_memory():
     """Returns available CPU memory in GB."""
-    return psutil.virtual_memory().available / (1024**3)
+    try:
+        return psutil.virtual_memory().available / (1024**3)
+    except Exception:
+        return 0
 
 # Check memory before deciding quantization etc.
 available_gpu_gb = get_gpu_memory()
@@ -120,26 +127,31 @@ if can_use_qlora:
     # model_load_kwargs["device_map"] = device_map # Avoid device_map with manual PEFT wrapping
     model_load_kwargs["low_cpu_mem_usage"] = True # Try to reduce CPU RAM usage during loading
 
-    # Determine model type for PEFT TaskType
-    # This is a heuristic, might need manual adjustment
+    # Determine model type for PEFT TaskType and default LORA_TARGET_MODULES if not set
     model_name_lower = LANGUAGE_MODEL_NAME.lower()
     if "t5" in model_name_lower or "bart" in model_name_lower:
         task_type = TaskType.SEQ_2_SEQ_LM
-        # T5/Bart often work well with these target modules
-        LORA_TARGET_MODULES = ["q", "v"] if not LORA_TARGET_MODULES else LORA_TARGET_MODULES
+        default_targets = ["q", "v"]
     elif "gpt" in model_name_lower or "opt" in model_name_lower or "llama" in model_name_lower or "falcon" in model_name_lower or "mistral" in model_name_lower:
         task_type = TaskType.CAUSAL_LM
-        # Default targets for Causal LMs (may need specifics)
-        LORA_TARGET_MODULES = ["q_proj", "v_proj"] if not LORA_TARGET_MODULES else LORA_TARGET_MODULES
-        # Refine common targets for specific families if needed
+        default_targets = ["q_proj", "v_proj"] # Common starting point
         if "llama" in model_name_lower or "mistral" in model_name_lower:
-             LORA_TARGET_MODULES = ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"] # More comprehensive
+             # Llama/Mistral often benefit from targeting more layers
+             default_targets = ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         elif "falcon" in model_name_lower:
-             LORA_TARGET_MODULES = ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
+             default_targets = ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
     else:
-        warnings.warn(f"Could not reliably determine PEFT TaskType for {LANGUAGE_MODEL_NAME}. Defaulting to CAUSAL_LM. Adjust manually if needed.")
+        warnings.warn(f"Could not reliably determine PEFT TaskType or default LoRA targets for {LANGUAGE_MODEL_NAME}. Defaulting to CAUSAL_LM and ['q_proj', 'v_proj']. Adjust manually if needed.")
         task_type = TaskType.CAUSAL_LM
-        LORA_TARGET_MODULES = ["q_proj", "v_proj"] if not LORA_TARGET_MODULES else LORA_TARGET_MODULES
+        default_targets = ["q_proj", "v_proj"]
+
+    # Use manually set LORA_TARGET_MODULES if provided, otherwise use inferred defaults
+    if LORA_TARGET_MODULES is None:
+         LORA_TARGET_MODULES = default_targets
+         print(f"Using inferred LoRA target modules: {LORA_TARGET_MODULES}")
+    else:
+        print(f"Using manually specified LoRA target modules: {LORA_TARGET_MODULES}")
+
 
     peft_config = LoraConfig(
         r=LORA_R,
@@ -149,7 +161,7 @@ if can_use_qlora:
         bias="none", # Usually set to 'none' for LoRA
         task_type=task_type
     )
-    print(f"PEFT Config: TaskType={task_type}, TargetModules={LORA_TARGET_MODULES}")
+    print(f"PEFT Config: TaskType={task_type}, R={LORA_R}, Alpha={LORA_ALPHA}, Dropout={LORA_DROPOUT}, TargetModules={LORA_TARGET_MODULES}")
 else:
     # If not using QLoRA, load model normally
     # Optionally use float16 if GPU supports it and has enough VRAM
@@ -169,14 +181,21 @@ try:
             print(f"Tokenizer pad_token set to eos_token ({tokenizer.eos_token}).")
         else:
             # Add a standard pad token if no EOS token exists
-            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-            print("Added '[PAD]' as pad_token.")
+            new_pad_token = '[PAD]'
+            tokenizer.add_special_tokens({'pad_token': new_pad_token})
+            print(f"Added '{new_pad_token}' as pad_token.")
+            # Important: Resize model embeddings if a new token was added
+            # This needs to happen *before* applying PEFT if model is loaded first
+            # We'll handle resizing after model loading for simplicity here.
 
 except Exception as e:
     raise RuntimeError(f"Failed to load tokenizer '{LANGUAGE_MODEL_NAME}': {e}")
 
 # --- Load Model ---
 print(f"Loading Language Model: {LANGUAGE_MODEL_NAME} {'with QLoRA' if can_use_qlora else ('with float16' if model_load_kwargs.get('torch_dtype') == torch.float16 else '')}")
+language_model = None # Initialize to None
+is_encoder_decoder = False # Initialize flag
+
 try:
     # Determine model class based on name heuristic (adjust if needed)
     model_name_lower = LANGUAGE_MODEL_NAME.lower()
@@ -193,26 +212,39 @@ try:
     )
     print(f"Model loaded. Type: {'Seq2Seq' if is_encoder_decoder else 'CausalLM'}")
 
+    # Resize embeddings if pad token was added *after* loading the model
+    if hasattr(tokenizer, 'new_pad_token_added') and tokenizer.new_pad_token_added:
+         language_model.resize_token_embeddings(len(tokenizer))
+         print(f"Resized model token embeddings to {len(tokenizer)} due to added pad token.")
+         delattr(tokenizer, 'new_pad_token_added') # Clean up flag
+
+
     # --- Verify Model Dimension ---
     # Check if the loaded model's dimension matches the expected dimension from Stage 4
     try:
-        if is_encoder_decoder:
+        actual_lm_dim = None
+        if hasattr(language_model.config, 'hidden_size'):
+             actual_lm_dim = language_model.config.hidden_size
+        elif hasattr(language_model.config, 'd_model'): # Common in T5/BART
             actual_lm_dim = language_model.config.d_model
-        else:
-            # Causal LMs often use hidden_size or n_embd
-            actual_lm_dim = getattr(language_model.config, 'hidden_size', getattr(language_model.config, 'n_embd', None))
-            if actual_lm_dim is None:
-                 # Try to get from embedding layer if config is unclear
-                 embed_layer = language_model.get_input_embeddings()
-                 if embed_layer:
-                      actual_lm_dim = embed_layer.embedding_dim
-                 else:
-                     warnings.warn("Could not determine actual LM dimension from config or embeddings.")
+        elif hasattr(language_model.config, 'n_embd'): # Common in older GPT models
+            actual_lm_dim = language_model.config.n_embd
 
+        if actual_lm_dim is None:
+             # Try to get from embedding layer if config is unclear
+             embed_layer = None
+             if hasattr(language_model, 'get_input_embeddings'):
+                  embed_layer = language_model.get_input_embeddings()
+             elif hasattr(language_model, 'transformer') and hasattr(language_model.transformer, 'wte'): # GPT-2 style
+                  embed_layer = language_model.transformer.wte
+
+             if embed_layer:
+                  actual_lm_dim = embed_layer.embedding_dim
+             else:
+                 warnings.warn("Could not determine actual LM dimension from config or embeddings.")
 
         if actual_lm_dim and actual_lm_dim != TARGET_LANGUAGE_MODEL_DIM:
-            warnings.warn(f"Mismatch! Stage 4 Target LM Dim ({TARGET_LANGUAGE_MODEL_DIM}) != Actual Loaded LM Dim ({actual_lm_dim}). Check Stage 4 config or LM choice.")
-            # Potentially raise error or try to adapt Stage 4? For now, just warn.
+            warnings.warn(f"Potential Mismatch! Stage 4 Target LM Dim ({TARGET_LANGUAGE_MODEL_DIM}) != Actual Loaded LM Dim ({actual_lm_dim}). Check Stage 4 config or LM choice. Bridge projection might be incorrect.")
         elif actual_lm_dim:
             print(f"Loaded LM dimension ({actual_lm_dim}) matches target dimension ({TARGET_LANGUAGE_MODEL_DIM}).")
 
@@ -226,8 +258,9 @@ except Exception as e:
     print("Try using a smaller model or enabling QLoRA if memory is the issue.")
     import traceback
     traceback.print_exc()
-    # Exit or handle gracefully
-    language_model = None # Ensure it's None if loading failed
+    # Ensure model is None if loading failed
+    language_model = None
+
 
 # --- Apply PEFT (LoRA adapters) if model loaded successfully and QLoRA enabled ---
 if language_model and can_use_qlora and peft_config:
@@ -242,7 +275,7 @@ if language_model and can_use_qlora and peft_config:
          warnings.warn(f"Could not prepare model for k-bit training: {e_prep}. Proceeding without it.")
 
 
-    print(f"Applying PEFT (LoRA) adapters with config: R={LORA_R}, Alpha={LORA_ALPHA}, Targets={LORA_TARGET_MODULES}")
+    print(f"Applying PEFT (LoRA) adapters...")
     try:
         language_model = get_peft_model(language_model, peft_config)
         print("PEFT model created successfully.")
@@ -252,15 +285,13 @@ if language_model and can_use_qlora and peft_config:
         print(f"ValueError: {e}")
         print("You can inspect the base model's layers using print(base_model).")
         warnings.warn("Proceeding with the base quantized model WITHOUT LoRA adapters.")
-        # Need to get the original model back if get_peft_model failed
-        # This is tricky as the model might be modified in place by prepare_...
-        # Best approach if PEFT fails is often to reload the model without PEFT attempt.
-        can_use_qlora = False # Indicate LoRA is not active
-        # Reload model without PEFT if possible (optional, depends on desired behavior)
-        # language_model = model_class.from_pretrained(LANGUAGE_MODEL_NAME, **model_load_kwargs)
+        # Indicate LoRA is not active
+        can_use_qlora = False
+        peft_config = None # Nullify peft_config as it wasn't applied
     except Exception as e:
          warnings.warn(f"An unexpected error occurred applying PEFT: {e}\nProceeding without LoRA adapters.")
          can_use_qlora = False
+         peft_config = None
 
 
 # Ensure model is on the correct device if not using device_map
@@ -271,15 +302,21 @@ if language_model and "device_map" not in model_load_kwargs:
         print(f"Model successfully moved to {device}.")
     except Exception as e_move:
          warnings.warn(f"Could not move model to {device}: {e_move}. Model might remain on CPU or previous device.")
-elif language_model:
+elif language_model and hasattr(language_model, 'device'):
     # With device_map='auto', the model is already on assigned devices.
-    # We can infer the primary device from a parameter for later tensor placement.
-    try:
-        inferred_device = next(language_model.parameters()).device
-        print(f"Model loaded with device_map. Primary device inferred as: {inferred_device}")
-        device = inferred_device # Update device variable for tensor placement
-    except Exception as e_infer:
-         warnings.warn(f"Could not infer device from model parameters: {e_infer}. Using configured device: {device}")
+    # Update device variable for tensor placement.
+    inferred_device = language_model.device
+    print(f"Model loaded with device_map. Primary device inferred as: {inferred_device}")
+    device = inferred_device
+elif language_model:
+     # Fallback if device attribute not present after device_map
+     try:
+          inferred_device = next(language_model.parameters()).device
+          print(f"Model loaded with device_map. Inferring device from first parameter: {inferred_device}")
+          device = inferred_device
+     except Exception as e_infer_param:
+          warnings.warn(f"Could not infer device from model parameters after device_map: {e_infer_param}. Using configured device: {device}")
+
 
 
 # --- Generation Function ---
@@ -306,7 +343,7 @@ def generate_text_from_embedding(model: PreTrainedModel | PeftModel,
                                                 If None, assumes unconditional generation from BOS.
         max_new_tokens (int): Max *new* tokens to generate (excluding prompt).
         num_beams (int): Number of beams for beam search (if do_sample=False).
-        do_sample (bool): Use sampling if True, otherwise beam/greedy.
+        do_sample (bool): Use sampling if True, otherwise deterministic (False, e.g., beam search/greedy).
         temperature (float): Softmax temperature for sampling.
         top_k (int): Top-k sampling parameter.
         top_p (float): Nucleus sampling parameter.
@@ -325,6 +362,7 @@ def generate_text_from_embedding(model: PreTrainedModel | PeftModel,
     batch_size = visual_embedding.shape[0]
 
     # --- Prepare inputs for the model ---
+    prompt_length = 0 # Initialize prompt length
     if input_text_prompt:
         # Check batch size consistency
         if len(input_text_prompt) != batch_size:
@@ -334,25 +372,25 @@ def generate_text_from_embedding(model: PreTrainedModel | PeftModel,
         attention_mask = inputs.attention_mask.to(model_device)
         prompt_length = input_ids.shape[1] # Length of the tokenized prompt
     else:
-        # For unconditional generation (e.g., report), start with BOS token
+        # For unconditional generation (e.g., report), start with BOS token for CausalLM
         # Seq2Seq models often handle decoder start internally if `input_ids` isn't given to `generate`.
-        # CausalLMs require a starting token.
         if not is_encoder_decoder_model:
-             input_ids = torch.full((batch_size, 1), tokenizer.bos_token_id, dtype=torch.long).to(model_device)
+             # Ensure BOS token ID exists
+             bos_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id # Fallback to EOS if BOS is missing
+             if bos_token_id is None:
+                 raise ValueError("Tokenizer must have a bos_token_id or eos_token_id for unconditional CausalLM generation.")
+             input_ids = torch.full((batch_size, 1), bos_token_id, dtype=torch.long).to(model_device)
              attention_mask = torch.ones_like(input_ids)
              prompt_length = 1
         else:
             # For Seq2Seq unconditional, let generate handle decoder start
             input_ids = None # Or tokenizer("", return_tensors="pt").input_ids.to(model_device) ? Check HF docs.
             attention_mask = None
-            prompt_length = 0 # No prompt tokens
+            prompt_length = 0 # No explicit prompt tokens
 
     # --- Prepare visual features ---
     # Needs shape (BatchSize, SequenceLength=1, EmbeddingDim) for cross-attention
-    # or to be merged with input embeddings for Causal LMs.
     encoder_hidden_states = visual_embedding.unsqueeze(1).to(model_device)
-    # Create a dummy attention mask for the visual features (sequence length 1)
-    encoder_attention_mask = torch.ones(batch_size, 1, dtype=torch.long, device=model_device)
 
 
     # --- Setup GenerationConfig ---
@@ -361,12 +399,14 @@ def generate_text_from_embedding(model: PreTrainedModel | PeftModel,
         max_new_tokens=max_new_tokens,
         num_beams=num_beams,
         do_sample=do_sample,
-        temperature=temperature if do_sample else None, # Only use temp if sampling
+        temperature=temperature if do_sample else 1.0, # Temp doesn't matter if not sampling
         top_k=top_k if do_sample else None,            # Only use top_k if sampling
         top_p=top_p if do_sample else None,            # Only use top_p if sampling
         early_stopping=True if num_beams > 1 else False, # Stop when beams finish
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
+        # Force setting bos_token_id for Causal LMs if needed by generation logic (sometimes helps)
+        bos_token_id=tokenizer.bos_token_id if not is_encoder_decoder_model else None,
         # Suppress specific warnings during generation if needed
         # suppress_warnings=True,
     )
@@ -379,19 +419,18 @@ def generate_text_from_embedding(model: PreTrainedModel | PeftModel,
         # The `input_ids` provided here are used as `decoder_input_ids` to start generation
         if input_ids is not None:
              model_inputs["input_ids"] = input_ids
-             model_inputs["attention_mask"] = attention_mask # Masks the decoder inputs
+             # Pass attention_mask if input_ids are provided (for decoder)
+             model_inputs["attention_mask"] = attention_mask
         else:
              # If no input prompt, generate handles decoder start (usually pad token)
+             # T5/FLAN-T5 might expect a single pad token as decoder input for unconditional gen
+             # Let Huggingface `generate` handle this default.
              pass
 
     else: # Causal LM
-        # Standard Causal LMs don't have a separate encoder input.
-        # Conditioning requires either:
-        # A) Modifying input embeddings: Prepend visual features to token embeddings. Requires custom projection & embedding layer handling.
-        # B) Using a model specifically designed for multimodal input (like LLaVA, MiniGPT-4).
-        # C) Prompt engineering: Convert visual info to text and prepend (less effective).
-        # This basic example will pass the visual features, but a standard CausalLM might ignore them
-        # without architectural changes. For demonstration, we proceed.
+        # Standard Causal LMs don't have a separate encoder input. Conditioning requires modifications.
+        # Option B: Pass visual embeddings via `inputs_embeds`. Needs careful construction.
+        # Here, we demonstrate passing standard inputs, acknowledging limitations.
         warnings.warn("Standard CausalLM generation with visual conditioning via 'encoder_hidden_states' might be ignored by the model. Architectural changes (e.g., custom embedding layer, multimodal models) are typically required for effective CausalLM visual conditioning.")
 
         # If we have starting input_ids (like BOS or prompt), pass them
@@ -399,10 +438,10 @@ def generate_text_from_embedding(model: PreTrainedModel | PeftModel,
             model_inputs["input_ids"] = input_ids
             model_inputs["attention_mask"] = attention_mask
 
-        # We *could* try passing visual features as `encoder_hidden_states` and `encoder_attention_mask`
-        # if the CausalLM has cross-attention layers enabled (some variants might), but it's non-standard.
-        # model_inputs["encoder_hidden_states"] = encoder_hidden_states
-        # model_inputs["encoder_attention_mask"] = encoder_attention_mask
+        # We *could* try passing visual features as `encoder_hidden_states` if the CausalLM has cross-attention
+        # enabled (e.g., some modified architectures), but it's non-standard for typical GPT-like models.
+        # For demonstration, we do NOT pass encoder_hidden_states here for standard Causal LMs.
+        # model_inputs["encoder_hidden_states"] = encoder_hidden_states # Usually ignored
 
 
     # --- Generate Text ---
@@ -429,17 +468,19 @@ def generate_text_from_embedding(model: PreTrainedModel | PeftModel,
         import traceback
         traceback.print_exc()
         # Create dummy output sequences if generation failed
-        output_sequences = torch.full((batch_size, prompt_length + 1), tokenizer.pad_token_id, device=model_device)
+        # Ensure the dummy sequence length is at least prompt_length + 1
+        dummy_len = prompt_length + 1
+        output_sequences = torch.full((batch_size, dummy_len), tokenizer.pad_token_id, device=model_device)
 
 
     # --- Decode generated sequences ---
-    # Remove prompt tokens from the beginning of the generated sequence if a prompt was given
-    # This is standard practice for CausalLMs, Seq2Seq output usually doesn't include prompt.
-    if not is_encoder_decoder_model and input_ids is not None:
+    # For CausalLMs, remove prompt tokens from the beginning if a prompt was given
+    if not is_encoder_decoder_model and prompt_length > 0:
          # Slice the output sequences to remove the prompt part
          actual_output_sequences = output_sequences[:, prompt_length:]
     else:
          # For Seq2Seq, the output doesn't include the input prompt
+         # Also for CausalLM started with only BOS (prompt_length=1), we keep the full output
          actual_output_sequences = output_sequences
 
     #print(f"Output sequences after slicing prompt (if any): {actual_output_sequences.shape}")
@@ -447,14 +488,14 @@ def generate_text_from_embedding(model: PreTrainedModel | PeftModel,
     generated_texts = tokenizer.batch_decode(actual_output_sequences, skip_special_tokens=True)
 
     # Clean up memory
-    del model_inputs, encoder_hidden_states, encoder_attention_mask
+    del model_inputs, encoder_hidden_states
     if 'input_ids' in locals() and input_ids is not None: del input_ids
     if 'attention_mask' in locals() and attention_mask is not None: del attention_mask
     if output_sequences is not None: del output_sequences
     if 'actual_output_sequences' in locals() and actual_output_sequences is not None: del actual_output_sequences
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        gc.collect() # Force garbage collection
+    gc.collect() # Force garbage collection
 
     return generated_texts
 
@@ -537,7 +578,8 @@ if __name__ == "__main__": # Ensures this runs only when script is executed dire
             traceback.print_exc()
 
     # Optional: Clean up model and tokenizer from memory
-    del language_model, tokenizer
+    if 'language_model' in locals() and language_model is not None: del language_model
+    if 'tokenizer' in locals() and tokenizer is not None: del tokenizer
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()

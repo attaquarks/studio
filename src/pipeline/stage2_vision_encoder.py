@@ -57,9 +57,33 @@ class VisionEncoder(nn.Module):
                  # Fallback for ViT if no head attribute - get from final block or norm layer output
                  # This might require inspecting the specific timm model structure
                  if hasattr(self.model, 'norm') and hasattr(self.model.norm, 'normalized_shape'):
-                      self.feature_dim = self.model.norm.normalized_shape[0]
-                      # We don't remove norm, features are usually taken before it for avg pool, or after for CLS token
-                      # If using CLS, the feature dim is already correct. If avg pooling, we average before norm.
+                      # Check if normalized_shape is an iterable (like tuple/list) or int
+                      norm_shape = self.model.norm.normalized_shape
+                      if isinstance(norm_shape, (list, tuple)) and len(norm_shape) > 0:
+                           self.feature_dim = norm_shape[0]
+                      elif isinstance(norm_shape, int):
+                           self.feature_dim = norm_shape
+                      else:
+                           # Attempt inference through a dummy forward pass if structure is unknown
+                           warnings.warn(f"Could not determine feature dim from norm layer shape ({norm_shape}). Attempting dummy forward pass.")
+                           try:
+                                dummy_input = torch.randn(1, 3, IMG_SIZE, IMG_SIZE) # Use IMG_SIZE from config
+                                # Try forward_features first
+                                if hasattr(self.model, 'forward_features'):
+                                     dummy_output = self.model.forward_features(dummy_input)
+                                else: # Fallback to full forward
+                                     dummy_output = self.model(dummy_input)
+
+                                if len(dummy_output.shape) == 3: # ViT-like (B, SeqLen, D)
+                                     self.feature_dim = dummy_output.shape[-1]
+                                elif len(dummy_output.shape) == 2: # Possibly already pooled (B, D)
+                                     self.feature_dim = dummy_output.shape[-1]
+                                else: # Likely CNN features (B, D, H', W') - not directly usable here
+                                     raise ValueError("Dummy forward pass output shape not recognized for dim inference.")
+                                print(f"Inferred feature_dim via dummy forward pass: {self.feature_dim}")
+                           except Exception as e_dummy:
+                                warnings.warn(f"Dummy forward pass failed ({e_dummy}). Assuming feature_dim=768. Check model structure.")
+                                self.feature_dim = 768 # Default fallback
                  else:
                       # Last resort: try to infer from a known common dimension (less robust)
                       warnings.warn(f"Could not automatically determine feature dim for {self.model_name}. Assuming 768. Check model structure.")

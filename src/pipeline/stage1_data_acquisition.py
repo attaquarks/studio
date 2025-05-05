@@ -228,16 +228,17 @@ class MRIDataset(Dataset):
             except Exception as e:
                  warnings.warn(f"Error transforming slice {i} for index {idx}: {e}. Skipping slice.")
                  # Append a dummy tensor of the correct target size if a slice fails transform
-                 dummy_slice = torch.zeros((1, self.img_size, self.img_size)) # Start with 1 channel
-                 dummy_transformed = self.base_transform(dummy_slice) # Apply transforms to get correct channels/size/norm
+                 # Create a dummy HWC tensor first (compatible with ToTensor)
+                 dummy_slice_hw = np.zeros((self.img_size, self.img_size), dtype=np.float32)
+                 dummy_transformed = self.base_transform(dummy_slice_hw) # Apply transforms to get correct channels/size/norm
                  processed_slices_list.append(dummy_transformed)
 
 
         # If all slices failed (unlikely but possible), processed_slices_list might be empty
         if not processed_slices_list:
              warnings.warn(f"All slices failed transformation for index {idx}. Returning batch of dummy slices.")
-             dummy_slice = torch.zeros((1, self.img_size, self.img_size))
-             dummy_transformed = self.base_transform(dummy_slice)
+             dummy_slice_hw = np.zeros((self.img_size, self.img_size), dtype=np.float32)
+             dummy_transformed = self.base_transform(dummy_slice_hw)
              # Ensure 3 channels if needed by repeating the dummy transformed slice
              if dummy_transformed.shape[0] == 1:
                   dummy_transformed = dummy_transformed.repeat(3, 1, 1)
@@ -334,9 +335,19 @@ if __name__ == "__main__": # Ensures this runs only when script is executed dire
         # Find first valid path index
         first_valid_idx = -1
         for i, p in enumerate(dummy_file_paths):
-            if os.path.exists(p) or os.path.exists(os.path.join(p, os.path.basename(p)+'_'+MRI_TYPE_SUFFIX)):
-                first_valid_idx = i
-                break
+            # Check if directory path exists OR if it's a direct file path that exists
+            full_path_check = os.path.join(p, os.path.basename(p) + '_' + MRI_TYPE_SUFFIX) if os.path.isdir(p) else p
+            if os.path.exists(p) or os.path.exists(full_path_check):
+                 # More thorough check for directory case
+                 if os.path.isdir(p):
+                      scan_name = os.path.basename(p)
+                      mri_scan_path = os.path.join(p, f'{scan_name}_{MRI_TYPE_SUFFIX}')
+                      if os.path.exists(mri_scan_path):
+                            first_valid_idx = i
+                            break
+                 elif os.path.isfile(p): # Direct file path case
+                      first_valid_idx = i
+                      break
 
         if first_valid_idx != -1:
             single_item = train_dataset[first_valid_idx]
@@ -353,11 +364,14 @@ if __name__ == "__main__": # Ensures this runs only when script is executed dire
              print("No valid dummy paths found to test single item retrieval.")
 
         print("\nTesting single item retrieval (non-existent item)...")
-        non_existent_idx = dummy_file_paths.index('./non_existent_dir')
-        single_item_error = train_dataset[non_existent_idx]
-        print(f"Error item keys: {single_item_error.keys()}")
-        print(f"Error item pixel values shape: {single_item_error['pixel_values'].shape}") # Should be dummy shape
-        print(f"Error item pixel values min/max: {single_item_error['pixel_values'].min():.2f} / {single_item_error['pixel_values'].max():.2f}")
+        if './non_existent_dir' in dummy_file_paths:
+            non_existent_idx = dummy_file_paths.index('./non_existent_dir')
+            single_item_error = train_dataset[non_existent_idx]
+            print(f"Error item keys: {single_item_error.keys()}")
+            print(f"Error item pixel values shape: {single_item_error['pixel_values'].shape}") # Should be dummy shape
+            print(f"Error item pixel values min/max: {single_item_error['pixel_values'].min():.2f} / {single_item_error['pixel_values'].max():.2f}")
+        else:
+            print("Non-existent path not found in dummy paths list.")
 
 
         # Create DataLoaders
@@ -367,14 +381,17 @@ if __name__ == "__main__": # Ensures this runs only when script is executed dire
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
         # Get a sample batch
-        sample_batch = next(iter(train_loader))
-        print(f"\nSample batch loaded. Keys: {sample_batch.keys()}")
-        print(f"Batch pixel values shape: {sample_batch['pixel_values'].shape}") # Should be (BatchSize, NumSlices, Channels, ImgSize, ImgSize)
-        if 'question' in sample_batch:
-            print(f"Batch sample question: {sample_batch['question'][0]}")
-            print(f"Batch sample answer: {sample_batch['answer'][0]}")
-        if 'report' in sample_batch:
-            print(f"Batch sample report: {sample_batch['report'][0]}")
+        if len(train_dataset) > 0 and first_valid_idx != -1 : # Ensure there's data to load
+             sample_batch = next(iter(train_loader))
+             print(f"\nSample batch loaded. Keys: {sample_batch.keys()}")
+             print(f"Batch pixel values shape: {sample_batch['pixel_values'].shape}") # Should be (BatchSize, NumSlices, Channels, ImgSize, ImgSize)
+             if 'question' in sample_batch:
+                 print(f"Batch sample question: {sample_batch['question'][0]}")
+                 print(f"Batch sample answer: {sample_batch['answer'][0]}")
+             if 'report' in sample_batch:
+                 print(f"Batch sample report: {sample_batch['report'][0]}")
+        else:
+             print("Skipping DataLoader test due to empty or invalid dataset.")
 
     except ImportError as ie:
          print(f"\nImportError: {ie}. Make sure necessary libraries (torch, torchvision, numpy, nibabel) are installed.")
