@@ -14,29 +14,27 @@ pipeline_dir = os.path.dirname(__file__)
 
 # Use try-except blocks for robustness if run standalone
 try:
-    from .stage1_data_acquisition import NeuroReportDataModule, MRIDataset, BATCH_SIZE, TARGET_SIZE, NUM_SLICES_PER_SCAN # Use DataModule
+    # Import DataModule definition, but not specific dataset class directly needed here
+    from .stage1_data_acquisition import NeuroReportDataModule, BATCH_SIZE, TARGET_SIZE, NUM_SLICES_PER_SCAN
 except ImportError:
     warnings.warn("Could not import from stage1. Defining dummy components for Stage 6 structure.")
     BATCH_SIZE = 2
     NUM_SLICES_PER_SCAN = 8
     TARGET_SIZE=(32, 32) # Small dummy size
-    # Define minimal dummy Dataset and DataModule classes
-    class MRIDataset(torch.utils.data.Dataset):
-        def __init__(self, *args, **kwargs): self.len = 10
-        def __len__(self): return self.len
-        def __getitem__(self, idx):
-            return {'pixel_values': torch.randn(NUM_SLICES_PER_SCAN, 3, TARGET_SIZE[0], TARGET_SIZE[1]),
-                    'question': f'Q{idx}', 'answer': f'A{idx}', 'report': f'R{idx}'} # Include all possible keys
     class NeuroReportDataModule(pl.LightningDataModule):
         def __init__(self, *args, **kwargs):
             super().__init__()
             self.batch_size = BATCH_SIZE
-        def setup(self, stage=None):
-            self.train_dataset = MRIDataset()
-            self.val_dataset = MRIDataset()
-        def train_dataloader(self): return DataLoader(self.train_dataset, batch_size=self.batch_size)
-        def val_dataloader(self): return DataLoader(self.val_dataset, batch_size=self.batch_size)
-
+        def setup(self, stage=None): pass # Minimal setup
+        def train_dataloader(self): # Need a dummy loader for structure
+            class DummyDataset(torch.utils.data.Dataset):
+                def __init__(self): self.len=10
+                def __len__(self): return self.len
+                def __getitem__(self, idx):
+                     # Return only pixel_values if annotations might be missing
+                     return {'pixel_values': torch.randn(NUM_SLICES_PER_SCAN, 3, TARGET_SIZE[0], TARGET_SIZE[1])}
+            return DataLoader(DummyDataset(), batch_size=self.batch_size)
+        # def val_dataloader(self): return None # No validation loader needed now
 
 try:
     from .stage2_vision_encoder import VisionEncoder, VISION_FEATURE_DIM as STAGE2_VISION_FEATURE_DIM
@@ -57,69 +55,74 @@ except ImportError:
         def forward(self, x, **kwargs): return x.mean(dim=1)
 
 try:
-    from .stage4_vision_language_bridge import CrossAttentionBridge, TARGET_LANGUAGE_MODEL_DIM as STAGE4_TARGET_DIM
+    # Bridge might be optional or Identity, handle its potential absence or type
+    from .stage4_vision_language_bridge import VisionLanguageBridge # Import the bridge class
+    # AGGREGATED_FEATURE_DIM needed for bridge init comes from Stage 3
+    # TARGET_LANGUAGE_MODEL_DIM needed for bridge init comes from Stage 5
 except ImportError:
-    warnings.warn("Could not import from stage4. Defining dummy CrossAttentionBridge.")
-    STAGE4_TARGET_DIM = 768 # Must match dummy LM dim below
-    class CrossAttentionBridge(nn.Module):
-        def __init__(self, language_dim=STAGE4_TARGET_DIM, **kwargs): super().__init__(); self.dummy = nn.Linear(10, language_dim)
-        def forward(self, vis, lang, **kwargs): return lang # Pass through dummy
+     warnings.warn("Could not import VisionLanguageBridge from stage4. Assuming Identity bridge.")
+     VisionLanguageBridge = nn.Identity # Use Identity if bridge file/class is missing
 
 try:
     from .stage5_language_decoder import LanguageDecoder, LANGUAGE_MODEL_NAME, model_type as STAGE5_LM_TYPE, USE_LORA as STAGE5_USE_LORA, LANGUAGE_MODEL_DIM as STAGE5_LM_DIM
-    # Verify LM dim consistency
-    if STAGE4_TARGET_DIM != STAGE5_LM_DIM:
-         warnings.warn(f"Mismatch! Stage 4 target dim ({STAGE4_TARGET_DIM}) != Stage 5 LM dim ({STAGE5_LM_DIM}). Check configurations.")
-         # Use Stage 5 dim as the definitive one if imported
-         STAGE4_TARGET_DIM = STAGE5_LM_DIM
-
+    TARGET_LANGUAGE_MODEL_DIM = STAGE5_LM_DIM # Use the dimension from the loaded LM
 except ImportError as e:
     warnings.warn(f"Could not import components from stage5 ({e}). Defining dummy components for Stage 6 structure.")
     LANGUAGE_MODEL_NAME = 'google/flan-t5-base' # Use a consistent model name
     STAGE5_LM_TYPE = 'seq2seq'
     STAGE5_USE_LORA = False
-    STAGE4_TARGET_DIM = 768 # Reset based on dummy T5
-    STAGE5_LM_DIM = STAGE4_TARGET_DIM
-    # Define dummy LanguageDecoder class (cannot easily load model here without full Stage 5 logic)
+    TARGET_LANGUAGE_MODEL_DIM = 768 # Reset based on dummy T5
+    STAGE5_LM_DIM = TARGET_LANGUAGE_MODEL_DIM
+    # Define dummy LanguageDecoder class
     class LanguageDecoder(nn.Module):
          def __init__(self, *args, **kwargs):
              super().__init__()
-             self.model = None # Cannot instantiate easily here
+             self.model = AutoModelForSeq2SeqLM.from_pretrained(LANGUAGE_MODEL_NAME) # Load dummy model
              self.tokenizer = AutoTokenizer.from_pretrained(LANGUAGE_MODEL_NAME)
              if self.tokenizer.pad_token is None: self.tokenizer.pad_token = self.tokenizer.eos_token
              self.model_dim = STAGE5_LM_DIM
+             self.model_type = STAGE5_LM_TYPE
+             self.use_lora = STAGE5_USE_LORA
          def get_model_dim(self): return self.model_dim
          def prepare_inputs(self, *args, **kwargs): return {'input_ids': torch.randint(0, 100, (2, 10)), 'attention_mask': torch.ones(2, 10)}
-         def forward(self, *args, **kwargs): return {'loss': torch.tensor(0.0)} # Dummy output with loss
+         def forward(self, labels=None, **kwargs): return {'loss': torch.tensor(0.0, requires_grad=True) if labels is not None else None} # Dummy output with loss
          def generate(self, *args, **kwargs): return torch.randint(0, 100, (2, 5)) # Dummy generated IDs
          def decode(self, *args, **kwargs): return ["dummy output"] * 2
 
 
 # --- Configuration ---
-LEARNING_RATE = 2e-5 # Often lower for fine-tuning large models, esp. with LoRA
+LEARNING_RATE = 1e-4 # Adjust based on experiments (might need lower for full model tuning, higher for LoRA)
 WEIGHT_DECAY = 0.01
-NUM_EPOCHS = 3
+NUM_EPOCHS = 3 # Adjust as needed for the full dataset
 MODEL_SAVE_PATH = "./neuroreport_model_checkpoint" # Directory to save checkpoints
 MAX_LABEL_LENGTH = 256 # Max length for target labels (reports/answers)
-WARMUP_STEPS = 100 # Steps for learning rate warmup
+WARMUP_STEPS_RATIO = 0.1 # Ratio of total steps for LR warmup
 GRADIENT_CLIP_VAL = 1.0 # Optional gradient clipping
 
 # --- Instantiate components (assuming they are loaded/imported correctly) ---
-# These should be the actual instances passed or created based on full config
 try:
-    # Assuming instances are created based on imported classes/configs
-    vision_encoder_instance = VisionEncoder() # Uses defaults from stage2 or dummy
-    slice_aggregator_instance = SliceAggregator() # Uses defaults from stage3 or dummy
+    # Instantiate based on imported classes/configs
+    # These should use the actual configurations defined in each stage file if run as a pipeline
+    vision_encoder_instance = VisionEncoder()
+    slice_aggregator_instance = SliceAggregator(feature_dim=vision_encoder_instance.feature_dim) # Pass the vision dim
     language_decoder_instance = LanguageDecoder() # Uses defaults from stage5 or dummy
-    cross_attention_bridge_instance = CrossAttentionBridge(
-        vision_dim=slice_aggregator_instance.output_dim, # Use actual output dim
-        language_dim=language_decoder_instance.get_model_dim() # Use actual LM dim
-    )
-    tokenizer_instance = language_decoder_instance.tokenizer # Get tokenizer from the decoder instance
+
+    # Determine if bridge is needed based on dimensions
+    aggregator_output_dim = slice_aggregator_instance.output_dim
+    language_model_dim = language_decoder_instance.get_model_dim()
+    if aggregator_output_dim != language_model_dim:
+         print(f"Dimensions mismatch: Aggregator ({aggregator_output_dim}) != LM ({language_model_dim}). Using VisionLanguageBridge.")
+         bridge_instance = VisionLanguageBridge(visual_dim=aggregator_output_dim, language_dim=language_model_dim)
+    else:
+         print("Dimensions match. Using Identity bridge.")
+         bridge_instance = nn.Identity()
+
+    tokenizer_instance = language_decoder_instance.tokenizer # Get tokenizer from the decoder
 
 except Exception as e_inst:
     print(f"Error instantiating pipeline components for training: {e_inst}")
     print("Check component definitions and configurations in previous stages.")
+    # Consider exiting or using fallback defaults if instantiation fails
     exit()
 
 
@@ -127,54 +130,38 @@ except Exception as e_inst:
 class NeuroReportModel(pl.LightningModule):
     """
     Combines all stages into a single model for end-to-end training using PyTorch Lightning.
-    Uses Cross-Attention Bridge.
+    Handles potentially missing annotations during training.
     """
     def __init__(self,
                  vision_encoder: VisionEncoder,
                  slice_aggregator: SliceAggregator,
-                 cross_attention_bridge: CrossAttentionBridge,
+                 bridge: nn.Module, # Can be VisionLanguageBridge or nn.Identity
                  language_decoder: LanguageDecoder,
-                 mode: str = "vqa", # 'vqa' or 'report'
+                 mode: str = "report", # Default to report as VQA needs questions
                  learning_rate: float = LEARNING_RATE,
                  weight_decay: float = WEIGHT_DECAY,
-                 warmup_steps: int = WARMUP_STEPS,
-                 max_label_length: int = MAX_LABEL_LENGTH):
+                 warmup_steps_ratio: float = WARMUP_STEPS_RATIO,
+                 max_label_length: int = MAX_LABEL_LENGTH,
+                 **kwargs): # Absorb other potential hparams from config
         super().__init__()
         # Save hyperparameters - important for loading checkpoints
         # Ignore large components to avoid saving them directly in hparams.yaml
-        self.save_hyperparameters(ignore=['vision_encoder', 'slice_aggregator', 'cross_attention_bridge', 'language_decoder'])
+        self.save_hyperparameters(ignore=['vision_encoder', 'slice_aggregator', 'bridge', 'language_decoder'])
 
         self.vision_encoder = vision_encoder
         self.slice_aggregator = slice_aggregator
-        self.cross_attention_bridge = cross_attention_bridge
+        self.bridge = bridge # Can be VisionLanguageBridge or nn.Identity
         self.language_decoder = language_decoder # Contains tokenizer and model
         self.mode = mode
 
         # Store training config params needed for optimizer/scheduler setup
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
-        self.warmup_steps = warmup_steps
+        self.warmup_steps_ratio = warmup_steps_ratio # Store ratio
         self.max_label_length = max_label_length
+        self.total_training_steps = 10000 # Placeholder, will be updated by trainer
+        self.warmup_steps = int(self.total_training_steps * self.warmup_steps_ratio) # Initial estimate
 
-        # --- Parameter Freezing Logic (Example) ---
-        # Freeze vision encoder backbone if needed (fine-tune only top layers or bridge/LM)
-        # if self.hparams.freeze_vision_backbone: # Assumes freeze_vision_backbone is saved in hparams
-        #     for param in self.vision_encoder.backbone.parameters():
-        #         param.requires_grad = False
-
-        # If using PEFT/LoRA, the LanguageDecoder's `get_peft_model` call
-        # should have already frozen the base LM and made only adapters trainable.
-        # We might only want to train adapters + bridge + aggregator (optionally).
-        # Example: Freeze everything *except* LoRA adapters and the bridge
-        # if self.language_decoder.use_lora:
-        #     print("Freezing non-LoRA and non-bridge parameters...")
-        #     for name, param in self.named_parameters():
-        #         is_trainable = False
-        #         if 'lora_' in name: is_trainable = True # Train LoRA adapters
-        #         if 'cross_attention_bridge' in name: is_trainable = True # Train bridge
-        #         # if 'slice_aggregator' in name: is_trainable = True # Optionally train aggregator
-        #         # if 'vision_encoder.fc' in name: is_trainable = True # Optionally train final VE layer
-        #         param.requires_grad = is_trainable
 
         print("\n--- Trainable Parameters in NeuroReportModel ---")
         self._log_trainable_parameters()
@@ -188,14 +175,11 @@ class NeuroReportModel(pl.LightningModule):
             if param.requires_grad:
                 print(f"  - Trainable: {name} ({param.numel():,})")
                 total_trainable_params += param.numel()
-            # else:
-            #     print(f"  - Frozen: {name} ({param.numel():,})") # Optional: log frozen params too
         print(f"Total Parameters: {total_params:,}")
         print(f"Trainable Parameters: {total_trainable_params:,}")
         if total_params > 0:
              print(f"Trainable Ratio: {total_trainable_params / total_params * 100:.4f}%")
         print("-" * 40 + "\n")
-
 
     def forward(self, pixel_values, input_ids=None, attention_mask=None, labels=None):
         """
@@ -203,196 +187,180 @@ class NeuroReportModel(pl.LightningModule):
 
         Args:
             pixel_values (torch.Tensor): Batch of image slices [B, S, C, H, W]
-            input_ids (torch.Tensor): Tokenized input text (question/prefix) [B, L_in]
-            attention_mask (torch.Tensor): Attention mask for input_ids [B, L_in]
+            input_ids (torch.Tensor, optional): Tokenized input text (question/prefix) [B, L_in]
+            attention_mask (torch.Tensor, optional): Attention mask for input_ids [B, L_in]
             labels (torch.Tensor, optional): Tokenized target text (answer/report) [B, L_out]. Required for loss.
 
         Returns:
-            Model output containing loss (e.g., Seq2SeqLMOutput or CausalLMOutputWithPast).
+            Model output containing loss (e.g., Seq2SeqLMOutput or CausalLMOutputWithPast). Loss is None if labels not provided.
         """
-        # 1. Extract visual features
-        # Input shape [B, S, C, H, W] -> Output shape [B, S, D_v]
-        visual_features_slices = self.vision_encoder(pixel_values)
+        # Stage 2: Vision Encoding
+        visual_features_slices = self.vision_encoder(pixel_values) # (B, S, D_v)
 
-        # 2. Aggregate slice features
-        # Input shape [B, S, D_v] -> Output shape [B, D_agg] (D_agg = Stage 3 output dim)
-        aggregated_visual_features = self.slice_aggregator(visual_features_slices)
+        # Stage 3: Slice Aggregation
+        aggregated_visual_features = self.slice_aggregator(visual_features_slices) # (B, D_agg)
 
-        # 3. Get language embeddings/hidden states from input text
-        # Input shapes [B, L_in] -> Output shape [B, L_in, D_l]
-        # Use the underlying LM's embedding layer or full forward pass if needed
-        # For Seq2Seq, encoder handles input_ids. For CausalLM, need embeddings.
+        # Stage 4: Bridging (Projection or Identity)
+        conditioned_embedding = self.bridge(aggregated_visual_features) # (B, D_l)
+
+        # Stage 5: Language Model Processing
+        # Prepare inputs for the specific language model type
+        model_inputs = {"return_dict": True}
+
         if self.language_decoder.model_type == 'seq2seq':
-            # Pass visual features later via encoder_outputs in the decoder call
-            # Process text inputs normally for the decoder start
-            decoder_input_ids = input_ids
-            decoder_attention_mask = attention_mask
-            # We don't strictly need language_features here as encoder_outputs handles context
-            # However, the Bridge requires language features. Let's get encoder's last hidden state?
-            # This deviates slightly from pure cross-attention conditioning via encoder_outputs.
-            # Alternative: Apply bridge *before* the decoder forward pass.
-            # Let's try passing the *aggregated* visual features directly as `encoder_hidden_states`.
-            # This requires the Bridge to output [B, 1, D_l] if projecting only visual.
-            # Let's revert to using the Bridge to modify decoder inputs based on visual context.
-
-            # Get decoder input embeddings
-            if hasattr(self.language_decoder.model, 'get_input_embeddings'):
-                language_embeds = self.language_decoder.model.get_input_embeddings()(decoder_input_ids)
-            else: # Fallback (e.g., T5 might need shared embeddings)
-                 language_embeds = self.language_decoder.model.shared(decoder_input_ids)
-                 warnings.warn("Using model.shared for embeddings in Seq2Seq.")
-
-            # Bridge visual and language features (using cross-attention inside bridge)
-            # The bridge expects [B, D_agg] and [B, L_in, D_l] -> outputs [B, L_in, D_l]
-            enhanced_language_features = self.cross_attention_bridge(
-                 aggregated_visual_features, # [B, D_agg]
-                 language_embeds,            # [B, L_in, D_l]
-                 language_attention_mask=decoder_attention_mask.bool() if decoder_attention_mask is not None else None
-            )
-            # Use enhanced features as input embeddings for the decoder
-            model_inputs = {
-                "inputs_embeds": enhanced_language_features,
-                "attention_mask": decoder_attention_mask,
-                "labels": labels,
-                # We *could* still pass original aggregated features as encoder_outputs
-                # if the decoder is designed for it, but using inputs_embeds is common.
-                # "encoder_outputs": (aggregated_visual_features.unsqueeze(1),), # Shape [B, 1, D_agg] - requires bridge inside decoder
-                "return_dict": True
-            }
-            outputs = self.language_decoder(**model_inputs)
-
+            # Reshape visual embedding for encoder_outputs: (B, 1, D_l)
+            encoder_hidden_states = conditioned_embedding.unsqueeze(1)
+            model_inputs["encoder_outputs"] = (encoder_hidden_states,)
+            # Seq2Seq models use input_ids as decoder_input_ids implicitly or explicitly
+            # If input_ids are None (e.g., report generation started by decoder_start_token),
+            # the generate method handles it, but forward needs something if labels are present.
+            # If fine-tuning, input_ids (like prefix) and labels must be provided.
+            if input_ids is not None: model_inputs["input_ids"] = input_ids
+            if attention_mask is not None: model_inputs["attention_mask"] = attention_mask # Decoder attention mask
+            if labels is not None: model_inputs["labels"] = labels
 
         elif self.language_decoder.model_type == 'causal_lm':
-            # For Causal LMs, we typically modify the `inputs_embeds`.
+            # Causal LMs typically need `inputs_embeds` for multimodal input.
+            # Constructing inputs_embeds requires token embeddings.
+            # Simple approach: Pass visual features via cross-attention if model supports it (rare for standard LMs).
+            # Workaround: Prepend visual features to text embeddings.
             if input_ids is None: # Should have input_ids (at least BOS) for CausalLM
-                raise ValueError("input_ids are required for CausalLM forward pass during training.")
+                 raise ValueError("input_ids are required for CausalLM forward pass during training.")
 
             # Get text embeddings
             language_embeds = self.language_decoder.model.get_input_embeddings()(input_ids) # [B, L_in, D_l]
 
-            # Bridge visual and language features
-            enhanced_language_features = self.cross_attention_bridge(
-                aggregated_visual_features, # [B, D_agg]
-                language_embeds,            # [B, L_in, D_l]
-                language_attention_mask=attention_mask.bool() if attention_mask is not None else None
-            ) # Output shape [B, L_in, D_l]
+            # --- Combine Visual and Text Embeddings ---
+            # Prepend the single conditioned visual embedding to the sequence of text embeddings.
+            # Visual embedding shape: [B, D_l] -> Unsqueeze to [B, 1, D_l]
+            visual_embeds_prep = conditioned_embedding.unsqueeze(1) # [B, 1, D_l]
 
-            # Pass enhanced embeddings to the Causal LM
-            # Note: `labels` need to align with the `inputs_embeds` sequence length.
-            # Ensure label preparation shifts labels correctly if needed.
-            outputs = self.language_decoder(
-                inputs_embeds=enhanced_language_features,
-                attention_mask=attention_mask,
-                labels=labels,
-                return_dict=True
-            )
+            # Concatenate: [B, 1, D_l] and [B, L_in, D_l] -> [B, 1 + L_in, D_l]
+            inputs_embeds = torch.cat([visual_embeds_prep, language_embeds], dim=1)
+            model_inputs["inputs_embeds"] = inputs_embeds
+
+            # --- Prepare corresponding attention mask and labels ---
+            # Attention mask needs to account for the added visual token.
+            # Visual token mask: [B, 1] (all ones)
+            visual_attention_mask = torch.ones(conditioned_embedding.shape[0], 1, dtype=torch.long, device=self.device)
+            # Concatenate with text attention mask: [B, 1] and [B, L_in] -> [B, 1 + L_in]
+            combined_attention_mask = torch.cat([visual_attention_mask, attention_mask], dim=1)
+            model_inputs["attention_mask"] = combined_attention_mask
+
+            # Labels also need shifting or masking for the visual token.
+            # Create labels for the visual token (e.g., -100 to ignore loss)
+            visual_labels = torch.full((conditioned_embedding.shape[0], 1), -100, dtype=torch.long, device=self.device)
+            # Concatenate with text labels: [B, 1] and [B, L_in] -> [B, 1 + L_in]
+            combined_labels = torch.cat([visual_labels, labels], dim=1)
+            model_inputs["labels"] = combined_labels
+
         else:
             raise ValueError(f"Unsupported language model type: {self.language_decoder.model_type}")
+
+        # Check if we have labels to calculate loss
+        if "labels" not in model_inputs or model_inputs["labels"] is None:
+            # If no labels, run inference pass (e.g., just get logits)
+            # Remove 'labels' key if present but None
+            model_inputs.pop("labels", None)
+            with torch.no_grad(): # No gradients needed if not calculating loss
+                 outputs = self.language_decoder.model(**model_inputs)
+            outputs.loss = None # Explicitly set loss to None
+        else:
+             # Run forward pass with labels to get loss
+             outputs = self.language_decoder.model(**model_inputs)
 
         return outputs
 
 
     def _prepare_batch(self, batch):
-        """Helper to tokenize text and prepare labels for loss calculation."""
-        # Ensure pixel_values are on the correct device
+        """Helper to tokenize text and prepare labels for loss calculation, handling missing annotations."""
         pixel_values = batch['pixel_values'].to(self.device)
+        batch_size = pixel_values.shape[0]
 
         input_texts = None
         target_texts = None
+        labels = None
+        input_ids = None
+        attention_mask = None
 
+        # Use tokenizer from the language_decoder instance
+        tokenizer = self.language_decoder.tokenizer
+
+        # --- Determine inputs and targets based on mode and available keys ---
         if self.mode == "vqa":
-            if 'question' not in batch or 'answer' not in batch:
-                 warnings.warn("VQA mode requires 'question' and 'answer' keys in batch.")
-                 return None # Cannot proceed
-            # Format for VQA (adjust based on LM expectations if needed)
-            input_texts = [f"question: {q} context: " for q in batch['question']]
-            target_texts = batch['answer']
-        elif self.mode == "report":
-            if 'report' not in batch:
-                 warnings.warn("Report mode requires 'report' key in batch.")
-                 return None # Cannot proceed
-            # Format for Report Generation (prefix can guide the model)
-            # For CausalLM, input might just be BOS, target is the full report.
-            # For Seq2Seq, input is prefix, target is the report.
-            if self.language_decoder.model_type == 'seq2seq':
-                 input_texts = ["generate report: "] * len(batch['report'])
-            else: # CausalLM - start with BOS token
-                 # Input text is effectively handled by starting with BOS embedding
-                 input_texts = [self.language_decoder.tokenizer.bos_token] * len(batch['report']) if self.language_decoder.tokenizer.bos_token else [""] * len(batch['report'])
+            if 'question' in batch and 'answer' in batch:
+                 input_texts = [f"question: {q} context: " for q in batch['question']]
+                 target_texts = batch['answer']
+            else: # Handle missing VQA annotations
+                 warnings.warn("VQA mode selected, but 'question' or 'answer' missing in batch. Cannot train on this batch.")
+                 return pixel_values, None, None, None # Return None for texts/labels
 
-            target_texts = batch['report']
+        elif self.mode == "report":
+            if 'report' in batch: # Use report if available
+                 target_texts = batch['report']
+                 # Choose prefix based on model type
+                 if self.language_decoder.model_type == 'seq2seq':
+                      input_texts = ["generate report: "] * batch_size
+                 else: # CausalLM - needs starting token(s)
+                      input_texts = [tokenizer.bos_token] * batch_size if tokenizer.bos_token else [""] * batch_size
+            else: # Handle missing report annotations
+                 warnings.warn("Report mode selected, but 'report' missing in batch. Cannot train on this batch.")
+                 return pixel_values, None, None, None # Return None for texts/labels
         else:
             raise ValueError(f"Invalid mode '{self.mode}'. Choose 'vqa' or 'report'.")
 
-        # --- Tokenize inputs ---
-        input_ids, attention_mask = None, None
-        try:
-            # Use the tokenizer from the language_decoder instance
-            tokenizer = self.language_decoder.tokenizer
-            input_encoding = tokenizer(
-                input_texts,
-                return_tensors='pt',
-                padding='longest',
-                truncation=True,
-                max_length=512 # Max length for input part
-            )
-            input_ids = input_encoding.input_ids.to(self.device)
-            attention_mask = input_encoding.attention_mask.to(self.device)
-        except Exception as e_tok_in:
-            warnings.warn(f"Error tokenizing input texts: {e_tok_in}")
-            return None # Cannot proceed without valid inputs
+        # --- Tokenize inputs if available ---
+        if input_texts:
+            try:
+                input_encoding = tokenizer(
+                    input_texts, return_tensors='pt', padding='longest', truncation=True, max_length=512
+                )
+                input_ids = input_encoding.input_ids.to(self.device)
+                attention_mask = input_encoding.attention_mask.to(self.device)
+            except Exception as e_tok_in:
+                warnings.warn(f"Error tokenizing input texts: {e_tok_in}")
+                input_ids, attention_mask = None, None # Mark as failed
 
-        # --- Tokenize targets (labels) ---
-        labels = None
-        try:
-            tokenizer = self.language_decoder.tokenizer
-            target_encoding = tokenizer(
-                target_texts,
-                return_tensors='pt',
-                padding='longest',
-                truncation=True,
-                max_length=self.max_label_length # Use configured max length for labels
-            )
-            labels = target_encoding.input_ids.to(self.device)
-
-            # Replace padding token id in labels with -100 for CrossEntropyLoss
-            labels[labels == tokenizer.pad_token_id] = -100
-        except Exception as e_tok_tgt:
-             warnings.warn(f"Error tokenizing target texts: {e_tok_tgt}")
-             # Allow proceeding without labels for eval steps, but training needs them
-             labels = None
-
-
-        # For CausalLM, labels often need to be the same as input_ids, shifted.
-        # However, HF models typically handle this internally when `labels` are passed alongside `input_ids` or `inputs_embeds`.
-        # Ensure the `labels` tensor corresponds correctly to the sequence passed (either via input_ids or inputs_embeds).
-        # If we prepend visual features to embeds, labels might need masking for the visual part.
-        # For simplicity with the current bridge modifying language embeds, we assume HF handles label alignment.
-
+        # --- Tokenize targets (labels) if available ---
+        if target_texts:
+            try:
+                target_encoding = tokenizer(
+                    target_texts, return_tensors='pt', padding='longest', truncation=True, max_length=self.max_label_length
+                )
+                labels = target_encoding.input_ids.to(self.device)
+                # Replace padding token id in labels with -100 for CrossEntropyLoss
+                labels[labels == tokenizer.pad_token_id] = -100
+            except Exception as e_tok_tgt:
+                 warnings.warn(f"Error tokenizing target texts: {e_tok_tgt}")
+                 labels = None # Mark as failed
 
         return pixel_values, input_ids, attention_mask, labels
 
     def training_step(self, batch, batch_idx):
         prep_result = self._prepare_batch(batch)
-        if prep_result is None:
-            warnings.warn(f"Skipping training step {batch_idx}: Batch preparation failed.")
-            return None # Skip step if batch prep failed
+        if prep_result is None: # Should not happen with current logic, but good practice
+            warnings.warn(f"Skipping training step {batch_idx}: Batch preparation failed fundamentally.")
+            return None
         pixel_values, input_ids, attention_mask, labels = prep_result
 
-        if labels is None:
-             warnings.warn(f"Skipping training step {batch_idx}: Labels are missing.")
-             return None # Skip step if labels missing
-
+        # Check if we have labels for this batch (essential for training)
+        if labels is None or (self.mode == 'vqa' and input_ids is None):
+             # If labels are missing, or VQA inputs are missing, skip training this batch.
+             warnings.warn(f"Skipping training step {batch_idx}: Missing required inputs/labels for mode '{self.mode}'.")
+             return None # Skip step
 
         # Perform forward pass to get loss
         try:
-            outputs = self(pixel_values=pixel_values, input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            # For CausalLM, labels are prepared inside forward based on inputs_embeds structure
+            if self.language_decoder.model_type == 'causal_lm':
+                 outputs = self(pixel_values=pixel_values, input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            else: # Seq2Seq
+                 outputs = self(pixel_values=pixel_values, input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss
         except Exception as e_fwd:
              warnings.warn(f"Error during training forward pass {batch_idx}: {e_fwd}")
              # Maybe return None or a zero tensor to avoid crashing trainer
              return torch.tensor(0.0, device=self.device, requires_grad=True) # Dummy loss
-
 
         if loss is None:
              warnings.warn(f"Loss is None for training batch {batch_idx}. Check model output and label preparation.")
@@ -402,76 +370,45 @@ class NeuroReportModel(pl.LightningModule):
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         return loss
 
-    def validation_step(self, batch, batch_idx):
-        prep_result = self._prepare_batch(batch)
-        if prep_result is None:
-            warnings.warn(f"Skipping validation step {batch_idx}: Batch preparation failed.")
-            return None
-        pixel_values, input_ids, attention_mask, labels = prep_result
-
-        if labels is None:
-             warnings.warn(f"Skipping validation step {batch_idx}: Labels are missing (cannot calculate val_loss).")
-             # If we still want to log generation metrics, we can proceed without loss
-             # For now, return None if loss cannot be calculated.
-             return None
-
-
-        try:
-            outputs = self(pixel_values=pixel_values, input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs.loss
-        except Exception as e_fwd:
-             warnings.warn(f"Error during validation forward pass {batch_idx}: {e_fwd}")
-             loss = None # Ensure loss is None
-
-
-        if loss is not None:
-            self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        else:
-            warnings.warn(f"Validation loss is None for batch {batch_idx}. Check model output.")
-
-        # Optionally generate text and calculate metrics here (can be slow)
-        # Example: Log generated text samples periodically
-        # if batch_idx % 10 == 0: # Log every 10 batches
-        #     self.log_validation_samples(batch, outputs) # Implement this helper method
-
-        # Return loss (or other metrics if calculated)
-        return loss
-
-
-    # Optional helper for logging validation samples
-    # def log_validation_samples(self, batch, outputs):
-    #     # ... logic to generate text using self.language_decoder.generate ...
-    #     # ... decode predictions and references ...
-    #     # ... log using self.logger.experiment.add_text ...
-    #     pass
-
+    # Remove validation_step as no validation split is used
+    # def validation_step(self, batch, batch_idx):
+    #     pass # No validation
 
     def configure_optimizers(self):
         """Configure optimizer and learning rate scheduler."""
-        # Filter parameters that require gradients
-        # This automatically handles PEFT/LoRA cases where only adapters are trainable
         trainable_params = [p for p in self.parameters() if p.requires_grad]
         if not trainable_params:
              warnings.warn("No trainable parameters found! Check model freezing logic and LoRA setup.")
-             # Add dummy parameter to optimizer to avoid crashing
-             optimizer = optim.AdamW([nn.Parameter(torch.zeros(1))], lr=self.learning_rate)
+             optimizer = optim.AdamW([nn.Parameter(torch.zeros(1))], lr=self.learning_rate) # Dummy
         else:
              print(f"Configuring optimizer for {len(trainable_params)} trainable parameter tensors.")
              optimizer = optim.AdamW(trainable_params, lr=self.learning_rate, weight_decay=self.weight_decay)
 
-        # Learning Rate Scheduler (Example: Linear warmup then decay)
+        # Learning Rate Scheduler (requires trainer access for total steps)
+        # The scheduler setup depends on when configure_optimizers is called relative to trainer init
         try:
             # Calculate total steps (required for some schedulers)
-            # Handle cases where trainer/estimated_stepping_batches might not be available yet
-            total_steps = self.trainer.estimated_stepping_batches if hasattr(self.trainer, 'estimated_stepping_batches') else 10000 # Estimate if needed
-            print(f"Total estimated training steps: {total_steps}")
-            print(f"Warmup steps: {self.warmup_steps}")
+            if hasattr(self.trainer, 'estimated_stepping_batches'):
+                 self.total_training_steps = self.trainer.estimated_stepping_batches
+                 print(f"Using trainer's estimated_stepping_batches: {self.total_training_steps}")
+            else:
+                 # Estimate manually if trainer attribute not available yet
+                 # This might happen if called before trainer.fit
+                 warnings.warn("Trainer attribute 'estimated_stepping_batches' not found. Estimating total steps.")
+                 # Placeholder estimation logic (adjust if needed)
+                 self.total_training_steps = len(self.trainer.datamodule.train_dataloader()) * self.trainer.max_epochs // getattr(self.trainer,'accumulate_grad_batches', 1)
+                 if self.total_training_steps <= 0: self.total_training_steps = 10000 # Fallback
+                 print(f"Manually estimated total steps: {self.total_training_steps}")
+
+
+            self.warmup_steps = int(self.total_training_steps * self.warmup_steps_ratio)
+            print(f"Warmup steps calculated: {self.warmup_steps}")
 
             scheduler = get_scheduler(
                 name="linear", # Example: linear warmup and decay
                 optimizer=optimizer,
                 num_warmup_steps=self.warmup_steps,
-                num_training_steps=total_steps
+                num_training_steps=self.total_training_steps
             )
             lr_scheduler_config = {
                 "scheduler": scheduler,
@@ -491,39 +428,55 @@ if __name__ == "__main__":
     print("--- Stage 6 Example ---")
 
     # --- Dummy DataModule Setup ---
-    # Assume data_module is instantiated correctly (using dummy or real data)
-    # This needs access to annotations file path and data directory path
-    DUMMY_DATA_DIR_S6 = "./dummy_mri_data_s6" # Use different dir for clarity
-    DUMMY_ANNOTATIONS_FILE_S6 = "./dummy_annotations_s6.csv"
-    # Recreate dummy data if needed
-    if not os.path.exists(DUMMY_ANNOTATIONS_FILE_S6):
-         os.makedirs(DUMMY_DATA_DIR_S6, exist_ok=True)
-         dummy_data_s6 = []
-         for i in range(10): # Small dummy dataset for example
-            scan_name = f"scan_{i+1}.nii.gz"
-            file_path = os.path.join(DUMMY_DATA_DIR_S6, scan_name)
-            dummy_volume = np.random.rand(32, 32, 10).astype(np.float32) # Very small volume
-            nib.save(nib.Nifti1Image(dummy_volume, np.eye(4)), file_path)
-            dummy_data_s6.append({'file_name': scan_name, 'question': f'Q{i}', 'answer': f'A{i}', 'report': f'R{i}'})
-         pd.DataFrame(dummy_data_s6).to_csv(DUMMY_ANNOTATIONS_FILE_S6, index=False)
-         print(f"Created dummy data for Stage 6 in {DUMMY_DATA_DIR_S6}")
+    # Use paths appropriate for the BraTS dataset downloaded via KaggleHub
+    # Assumes the kagglehub download placed it in './awsaf49-brats2020-training-data'
+    # Adjust DATA_DIR if your download path is different
+    DATA_DIR_S6 = "./awsaf49-brats2020-training-data/BraTS2020_TrainingData/MICCAI_BraTS2020_TrainingData" # Adjusted path
+    # Annotations might need to be created or downloaded separately. Using dummy path.
+    ANNOTATIONS_PATH_S6 = "./dummy_brats_annotations.csv" # Adjusted dummy path name
+
+    if not os.path.exists(DATA_DIR_S6):
+         print(f"ERROR: BraTS data directory not found at '{DATA_DIR_S6}'.")
+         print("Please download the dataset using KaggleHub and ensure the path is correct.")
+         exit()
+
+    # Recreate dummy annotations if needed, matching patient IDs from the actual data
+    if not os.path.exists(ANNOTATIONS_PATH_S6):
+         print(f"Creating dummy annotations file: {ANNOTATIONS_PATH_S6}")
+         # List actual patient IDs found in the data dir for the example
+         actual_patient_ids = [os.path.basename(p) for p in glob.glob(os.path.join(DATA_DIR_S6, "BraTS20_Training_*"))[:10]] # Use first 10 patients
+         if not actual_patient_ids:
+              print(f"Warning: Could not find example patient IDs in {DATA_DIR_S6} for dummy annotations.")
+              actual_patient_ids = [f"BraTS20_Training_{i:03}" for i in range(1,11)] # Fallback IDs
+
+         dummy_annot_data = []
+         for i, p_id in enumerate(actual_patient_ids):
+              dummy_annot_data.append({
+                  'patient_id': p_id, # Use actual patient IDs from dataset folders
+                  'question': f'Dummy Q for {p_id}',
+                  'answer': f'Dummy A for {p_id}',
+                  'report': f'Dummy report for patient {p_id}. Contains placeholder findings.'
+              })
+         pd.DataFrame(dummy_annot_data).to_csv(ANNOTATIONS_PATH_S6, index=False)
+         print(f"Created dummy annotations for patient IDs: {[d['patient_id'] for d in dummy_annot_data]}")
+
 
     data_module_instance = None
     try:
         data_module_instance = NeuroReportDataModule(
-            data_dir=DUMMY_DATA_DIR_S6,
-            annotations_path=DUMMY_ANNOTATIONS_FILE_S6,
+            data_dir=DATA_DIR_S6,
+            annotations_path=ANNOTATIONS_PATH_S6, # Use None if you don't have annotations yet
             batch_size=BATCH_SIZE,
-            mode="vqa", # Set mode consistent with dummy data/model task
-            target_size=TARGET_SIZE, # Use consistent target size
-            num_workers=0, # Use 0 for debugging
-            n_slices=NUM_SLICES_PER_SCAN # Use consistent slice count
+            mode="report", # Set mode consistent with dummy data/model task
+            target_size=TARGET_SIZE,
+            num_workers=0,
+            n_slices=NUM_SLICES_PER_SCAN
         )
         # Prepare data to ensure datasets are created before trainer needs them
         data_module_instance.prepare_data()
         data_module_instance.setup('fit')
     except Exception as e_dm:
-         print(f"Error creating dummy DataModule: {e_dm}")
+         print(f"Error creating DataModule: {e_dm}")
          data_module_instance = None # Ensure it's None if setup fails
 
     # --- Instantiate the main model ---
@@ -533,32 +486,33 @@ if __name__ == "__main__":
             neuro_report_model_instance = NeuroReportModel(
                 vision_encoder=vision_encoder_instance,
                 slice_aggregator=slice_aggregator_instance,
-                cross_attention_bridge=cross_attention_bridge_instance,
-                language_decoder=language_decoder_instance, # Contains tokenizer and model
-                mode="vqa", # Should match DataModule mode
+                bridge=bridge_instance,
+                language_decoder=language_decoder_instance,
+                mode="report", # Should match DataModule mode
                 learning_rate=LEARNING_RATE,
                 weight_decay=WEIGHT_DECAY,
-                warmup_steps=WARMUP_STEPS,
+                warmup_steps_ratio=WARMUP_STEPS_RATIO,
                 max_label_length=MAX_LABEL_LENGTH
             )
 
             # --- Configure Trainer ---
             os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
+            # Modify checkpointing - no validation loss to monitor
             checkpoint_callback = pl.callbacks.ModelCheckpoint(
                 dirpath=MODEL_SAVE_PATH,
-                filename='neuroreport-{epoch:02d}-{val_loss:.4f}',
-                save_top_k=1,       # Save only the best model based on monitor
-                monitor='val_loss', # Metric to monitor
-                mode='min',         # Mode for the monitored metric ('min' for loss)
-                save_last=True      # Optionally save the last checkpoint
+                filename='neuroreport-epoch={epoch:02d}-step={step}', # Save based on epoch/step
+                save_top_k=-1,       # Save all checkpoints or based on epoch/step
+                every_n_epochs=1,    # Save every epoch
+                save_last=True
             )
             lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval='step')
+            # Early stopping requires a validation metric, cannot be used without val_loader
             # early_stopping_callback = pl.callbacks.EarlyStopping(monitor='val_loss', patience=3, mode='min')
 
             # Determine precision based on QLoRA status
             precision_setting = '32-true' # Default
             if torch.cuda.is_available():
-                 if hasattr(language_decoder_instance, 'use_qlora') and language_decoder_instance.use_qlora:
+                 if language_decoder_instance.use_lora and hasattr(language_decoder_instance.model, 'quantization_config'): # Check if QLoRA active
                       precision_setting = '32-true' # Recommended for stability with bitsandbytes
                       print("Using QLoRA (4-bit): Trainer precision set to 32-true.")
                  elif torch.cuda.is_bf16_supported():
@@ -568,17 +522,16 @@ if __name__ == "__main__":
                       precision_setting = '16-mixed'
                       print("Using float16 mixed precision.")
 
-
             trainer = pl.Trainer(
                 max_epochs=NUM_EPOCHS,
                 accelerator="gpu" if torch.cuda.is_available() else "cpu",
                 devices="auto",
                 precision=precision_setting,
-                callbacks=[checkpoint_callback, lr_monitor], # Add callbacks
-                log_every_n_steps=10, # Log less frequently for faster example run
+                callbacks=[checkpoint_callback, lr_monitor], # No EarlyStopping
+                log_every_n_steps=10,
                 gradient_clip_val=GRADIENT_CLIP_VAL,
+                # No validation loop specified
                 # limit_train_batches=5, # DEBUG: Use fraction of training data
-                # limit_val_batches=2,   # DEBUG: Use fraction of validation data
             )
 
             print(f"\nPyTorch Lightning Trainer configured:")
@@ -589,9 +542,10 @@ if __name__ == "__main__":
             print("\nStarting training (fit call commented out for example)...")
 
             # --- Start Training ---
-            # trainer.fit(neuro_report_model_instance, datamodule=data_module_instance)
+            # No val_dataloaders provided to fit()
+            # trainer.fit(neuro_report_model_instance, train_dataloaders=data_module_instance.train_dataloader())
             print("\nTrainer.fit(...) call is commented out.")
-            print("To run training, ensure valid DataLoaders, dependencies, and uncomment the trainer.fit line.")
+            print("To run training, ensure valid DataLoader, dependencies, and uncomment the trainer.fit line.")
 
         except Exception as e:
             import traceback
@@ -600,15 +554,11 @@ if __name__ == "__main__":
     else:
         print("Skipping Trainer setup because DataModule could not be initialized.")
 
-    # Clean up dummy files (optional)
-    # import shutil
-    # try:
-    #     if os.path.exists(DUMMY_DATA_DIR_S6): shutil.rmtree(DUMMY_DATA_DIR_S6)
-    #     if os.path.exists(DUMMY_ANNOTATIONS_FILE_S6): os.remove(DUMMY_ANNOTATIONS_FILE_S6)
-    #     print("Cleaned up dummy files for Stage 6.")
-    # except Exception as e_clean: print(f"Error cleaning up Stage 6 dummy files: {e_clean}")
-
     print("\nStage 6: Training setup complete.\n")
 
 # Expose key training config for potential use in evaluation/inference stages
 # MODEL_SAVE_PATH, MAX_LABEL_LENGTH
+```
+  </change>
+  <change>
+    <file>src/pipeline
