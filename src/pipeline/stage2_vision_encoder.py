@@ -2,7 +2,19 @@
 import torch
 import torch.nn as nn
 import timm # Or use transformers library
+import warnings
+import os
 # from transformers import AutoModel
+
+# --- Import configurations from Stage 1 ---
+try:
+    from .stage1_data_acquisition import IMG_SIZE, NUM_SLICES_PER_SCAN, BATCH_SIZE
+except ImportError:
+    warnings.warn("Could not import configurations from stage1. Using placeholder values for Stage 2.")
+    IMG_SIZE = 224 # Placeholder
+    NUM_SLICES_PER_SCAN = 64 # Placeholder
+    BATCH_SIZE = 4 # Placeholder
+
 
 # --- Configuration ---
 VISION_MODEL_NAME = 'vit_base_patch16_224' # timm model name (e.g., ViT-Base)
@@ -10,15 +22,11 @@ VISION_MODEL_NAME = 'vit_base_patch16_224' # timm model name (e.g., ViT-Base)
 PRETRAINED = True
 FEATURE_EXTRACTION_METHOD = 'cls' # 'cls' or 'avg' pooling
 
-# Placeholder values from Stage 1 - these might be imported or passed
-IMG_SIZE = 224
-NUM_SLICES_PER_SCAN = 64
-BATCH_SIZE = 4
-
 # --- Vision Encoder Class ---
 class VisionEncoder(nn.Module):
     """
     Encodes batches of image slices using a pre-trained vision model (e.g., ViT).
+    Exposes the feature dimension via `self.feature_dim`.
     """
     def __init__(self, model_name=VISION_MODEL_NAME, pretrained=PRETRAINED,
                  feature_extraction_method=FEATURE_EXTRACTION_METHOD):
@@ -97,18 +105,32 @@ if __name__ == "__main__": # Ensures this runs only when script is executed dire
 
     # Instantiate the encoder
     try:
-        vision_encoder = VisionEncoder(model_name=VISION_MODEL_NAME, feature_extraction_method=FEATURE_EXTRACTION_METHOD)
+        vision_encoder = VisionEncoder(
+            model_name=VISION_MODEL_NAME,
+            pretrained=PRETRAINED,
+            feature_extraction_method=FEATURE_EXTRACTION_METHOD
+        )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         vision_encoder.to(device)
         dummy_pixel_values = dummy_pixel_values.to(device)
+        print(f"Running example on device: {device}")
+        print(f"Input dummy pixel values shape: {dummy_pixel_values.shape}")
+
 
         # Perform feature extraction
         vision_encoder.eval() # Set to evaluation mode for inference
         with torch.no_grad(): # Disable gradient calculation for inference
             slice_embeddings = vision_encoder(dummy_pixel_values)
 
-        print(f"Vision encoder output shape: {slice_embeddings.shape}") # Expected: (BatchSize, NumSlices, FeatureDimension)
-    except Exception as e:
-        print(f"Error initializing or running vision encoder: {e}")
+        print(f"Vision encoder output shape: {slice_embeddings.shape}")
+        # Expected: (BatchSize, NumSlices, FeatureDimension)
+        assert slice_embeddings.shape[0] == BATCH_SIZE
+        assert slice_embeddings.shape[1] == NUM_SLICES_PER_SCAN
+        assert slice_embeddings.shape[2] == vision_encoder.feature_dim # Check against instance attribute
 
-    print("Stage 2: Vision feature extraction setup complete.\n")
+    except Exception as e:
+        print(f"\nError during vision encoder test: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print("\nStage 2: Vision feature extraction setup complete.\n")

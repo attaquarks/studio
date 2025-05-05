@@ -5,21 +5,26 @@ import warnings # Import warnings
 import os # Import os for path manipulation in example
 
 # --- Import configurations from previous stages (assuming they exist) ---
-# If Stage 1 and 2 are in the same directory or accessible via sys.path
 try:
-    # It's generally better practice to manage configurations centrally (e.g., a config file)
-    # But for simplicity here, we might try importing if they define constants at module level
-    from .stage1_data_acquisition import BATCH_SIZE, NUM_SLICES_PER_SCAN # Add other needed vars like IMG_SIZE if required later
-    from .stage2_vision_encoder import VISION_FEATURE_DIM as STAGE2_VISION_FEATURE_DIM # Rename to avoid potential conflicts
+    from .stage1_data_acquisition import BATCH_SIZE, NUM_SLICES_PER_SCAN
+    # We need the feature dim from Stage 2 to initialize the aggregator correctly
+    from .stage2_vision_encoder import VisionEncoder # Import class to get dim
+    temp_vision_encoder = VisionEncoder() # Instantiate to get feature_dim
+    STAGE2_VISION_FEATURE_DIM = temp_vision_encoder.feature_dim
+    del temp_vision_encoder # Clean up temporary instance
 except ImportError:
-    warnings.warn("Could not import configurations from stage1/stage2. Using placeholder values.")
+    warnings.warn("Could not import configurations from stage1/stage2. Using placeholder values for Stage 3.")
     BATCH_SIZE = 4 # Placeholder
     NUM_SLICES_PER_SCAN = 64 # Placeholder
     STAGE2_VISION_FEATURE_DIM = 768 # Placeholder (e.g., ViT-Base)
+except Exception as e:
+     warnings.warn(f"Error importing/deriving config from stage1/stage2: {e}. Using placeholder values.")
+     BATCH_SIZE = 4 # Placeholder
+     NUM_SLICES_PER_SCAN = 64 # Placeholder
+     STAGE2_VISION_FEATURE_DIM = 768 # Placeholder (e.g., ViT-Base)
 
 
 # --- Configuration for Stage 3 ---
-# Use the imported dimension if available, otherwise use the placeholder
 VISION_FEATURE_DIM = STAGE2_VISION_FEATURE_DIM
 AGGREGATION_METHOD = 'mean' # Options: 'mean', 'lstm', 'gru', 'transformer'
 # Hidden dimension for RNNs or Transformer feedforward layer
@@ -45,16 +50,13 @@ class SliceAggregator(nn.Module):
         if self.method == 'mean':
             self.aggregator = None # Mean pooling is parameter-free
             self.output_dim = self.input_dim
-            print(f"Initialized Slice Aggregator with method '{self.method}'. Output dimension: {self.output_dim}")
         elif self.method == 'lstm':
             # batch_first=True expects input shape (Batch, Seq, Feature)
             self.aggregator = nn.LSTM(input_dim, hidden_dim, batch_first=True, bidirectional=False) # Or bidirectional=True
             self.output_dim = hidden_dim * (2 if self.aggregator.bidirectional else 1)
-            print(f"Initialized Slice Aggregator with method '{self.method}' (bidirectional={self.aggregator.bidirectional}). Output dimension: {self.output_dim}")
         elif self.method == 'gru':
             self.aggregator = nn.GRU(input_dim, hidden_dim, batch_first=True, bidirectional=False) # Or bidirectional=True
             self.output_dim = hidden_dim * (2 if self.aggregator.bidirectional else 1)
-            print(f"Initialized Slice Aggregator with method '{self.method}' (bidirectional={self.aggregator.bidirectional}). Output dimension: {self.output_dim}")
         elif self.method == 'transformer':
             # A simple Transformer Encoder stack
             encoder_layer = nn.TransformerEncoderLayer(
@@ -69,9 +71,10 @@ class SliceAggregator(nn.Module):
             self.output_dim = input_dim
             # Optional: Add a learnable [CLS] token equivalent for aggregation
             # self.cls_token = nn.Parameter(torch.zeros(1, 1, input_dim)) # Example CLS token
-            print(f"Initialized Slice Aggregator with method '{self.method}' (nhead={nhead}, nlayers={nlayers}). Output dimension: {self.output_dim}")
         else:
             raise ValueError(f"Unsupported aggregation method: {self.method}")
+
+        print(f"Initialized Slice Aggregator with method '{self.method}'. Output dimension: {self.output_dim}")
 
 
     def forward(self, slice_features):
@@ -86,9 +89,6 @@ class SliceAggregator(nn.Module):
             scan_embedding = slice_features.mean(dim=1) # Shape: (BatchSize, FeatureDimension)
         elif isinstance(self.aggregator, (nn.LSTM, nn.GRU)):
             # Pass features through RNN
-            # outputs shape: (Batch, Seq, NumDirections * HiddenSize)
-            # hidden shape: (NumLayers * NumDirections, Batch, HiddenSize) for GRU
-            # hidden shape: ((NumLayers * NumDirections, Batch, HiddenSize), (NumLayers * NumDirections, Batch, HiddenSize)) for LSTM (h_n, c_n)
             outputs, hidden = self.aggregator(slice_features)
 
             # Extract the final hidden state (last layer's hidden state)
@@ -130,6 +130,26 @@ class SliceAggregator(nn.Module):
 
         return scan_embedding
 
+# --- Determine Output Dimension Based on Config ---
+# This makes the output dimension available for import by Stage 4
+# We instantiate a temporary aggregator to get its configured output dim
+try:
+    temp_aggregator = SliceAggregator(
+        input_dim=VISION_FEATURE_DIM,
+        method=AGGREGATION_METHOD,
+        hidden_dim=AGGREGATOR_HIDDEN_DIM,
+        nhead=TRANSFORMER_NHEAD,
+        nlayers=TRANSFORMER_NLAYERS,
+        dropout=TRANSFORMER_DROPOUT
+    )
+    AGGREGATOR_OUTPUT_DIM = temp_aggregator.output_dim
+    print(f"Stage 3 Aggregator Output Dimension: {AGGREGATOR_OUTPUT_DIM}")
+    del temp_aggregator # Clean up
+except Exception as e:
+     warnings.warn(f"Could not determine AGGREGATOR_OUTPUT_DIM dynamically: {e}. Using placeholder.")
+     AGGREGATOR_OUTPUT_DIM = AGGREGATOR_HIDDEN_DIM if AGGREGATION_METHOD in ['lstm', 'gru'] else VISION_FEATURE_DIM
+
+
 # --- Example Usage ---
 if __name__ == "__main__": # Ensures this runs only when script is executed directly
     print("--- Stage 3 Example ---")
@@ -164,7 +184,8 @@ if __name__ == "__main__": # Ensures this runs only when script is executed dire
         print(f"Slice aggregator ({AGGREGATION_METHOD}) output shape: {scan_level_embedding.shape}")
         # Expected shape: (BatchSize, AggregatedFeatureDimension) where AggregatedFeatureDimension depends on method
         assert scan_level_embedding.shape[0] == BATCH_SIZE
-        assert scan_level_embedding.shape[1] == slice_aggregator.output_dim
+        # Use the dynamically determined output dim for assertion
+        assert scan_level_embedding.shape[1] == AGGREGATOR_OUTPUT_DIM
 
     except Exception as e:
         print(f"\nError during slice aggregator test: {e}")
@@ -172,5 +193,3 @@ if __name__ == "__main__": # Ensures this runs only when script is executed dire
         traceback.print_exc()
 
     print("\nStage 3: Slice aggregation setup complete.\n")
-
-    
