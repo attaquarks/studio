@@ -6,20 +6,21 @@ import warnings
 import json
 import torch
 import glob # To find checkpoints
+import pandas as pd # For creating dummy annotations
 
 # --- Import necessary components ---
 try:
     from .stage1_data_acquisition import NeuroReportDataModule # Data Handling
     from .stage6_training import NeuroReportModel # Model Definition
-    # Evaluation components are removed as testing is disabled
-    # from .stage7_evaluation import NeuroReportEvaluator, evaluate_pipeline
+    # Evaluation components (re-enable if needed)
+    from .stage7_evaluation import evaluate_pipeline, NeuroReportEvaluator
 except ImportError as e:
     warnings.warn(f"Could not import all components from previous stages: {e}. Training script might fail.")
     # Define minimal placeholders only if essential for script structure
     class NeuroReportDataModule(pl.LightningDataModule): pass
     class NeuroReportModel(pl.LightningModule): pass
-    # class NeuroReportEvaluator: pass # Not needed
-    # def evaluate_pipeline(*args, **kwargs): return {}, [], [] # Not needed
+    class NeuroReportEvaluator: pass
+    def evaluate_pipeline(*args, **kwargs): return {}, [], []
 
 
 # --- Argument Parser ---
@@ -36,9 +37,9 @@ def parse_args():
     parser.add_argument("--modalities", type=str, nargs='+', default=['t1ce', 'flair'], help="List of MRI modalities to load (e.g., t1ce flair t1 t2)")
     parser.add_argument("--batch_size", type=int, default=4, help="Training batch size")
     parser.add_argument("--num_workers", type=int, default=2, help="Number of data loader workers")
-    # Remove val/test split args
-    # parser.add_argument("--val_split", type=float, default=0.0, help="Validation split ratio (disabled)")
-    # parser.add_argument("--test_split", type=float, default=0.0, help="Test split ratio (disabled)")
+    # Re-enable val/test split args
+    parser.add_argument("--val_split", type=float, default=0.1, help="Validation split ratio")
+    parser.add_argument("--test_split", type=float, default=0.1, help="Test split ratio")
 
     # --- Model Arguments ---
     parser.add_argument("--vision_model_name", type=str, default="vit_base_patch16_224", help="Vision encoder model name (from timm)")
@@ -62,14 +63,14 @@ def parse_args():
     parser.add_argument("--strategy", type=str, default="auto", help="Distributed strategy ('ddp', 'fsdp', 'auto')")
     parser.add_argument("--log_every_n_steps", type=int, default=50, help="Log every N steps")
     parser.add_argument("--checkpoint_dir", type=str, default="./neuroreport_checkpoints", help="Checkpoint directory")
-    # Remove early stopping (needs validation metric)
-    # parser.add_argument("--early_stopping_patience", type=int, default=0, help="Patience for early stopping (disabled)")
+    # Re-enable early stopping
+    parser.add_argument("--early_stopping_patience", type=int, default=3, help="Patience for early stopping based on val_loss (0 to disable)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--max_label_length", type=int, default=256, help="Max sequence length for labels")
 
     # --- Action Arguments ---
-    # Remove testing after train flag
-    # parser.add_argument("--run_test_after_train", action=argparse.BooleanOptionalAction, default=False, help="Run evaluation on test set after training (disabled)")
+    # Re-enable testing after train flag
+    parser.add_argument("--run_test_after_train", action=argparse.BooleanOptionalAction, default=True, help="Run evaluation on test set after training")
 
     args = parser.parse_args()
 
@@ -94,10 +95,22 @@ def parse_args():
     # Validate data dir exists
     if not os.path.isdir(args.data_dir):
          raise FileNotFoundError(f"Data directory not found: {args.data_dir}. Please ensure the path is correct and the dataset is downloaded.")
-    # Validate annotations path if provided
-    if args.annotations_path and not os.path.isfile(args.annotations_path):
-         warnings.warn(f"Annotations file not found at {args.annotations_path}. Proceeding without annotations.")
-         args.annotations_path = None
+    # Validate annotations path if provided, create dummy if None
+    if args.annotations_path is None:
+         args.annotations_path = "./dummy_brats_annotations_training.csv"
+         if not os.path.exists(args.annotations_path):
+              print(f"No annotations path provided. Creating dummy annotations at {args.annotations_path}")
+              # Create dummy annotations based on data_dir
+              try:
+                   patient_ids = [os.path.basename(p) for p in glob.glob(os.path.join(args.data_dir, "BraTS20_Training_*")) if os.path.isdir(p)]
+                   if not patient_ids: raise FileNotFoundError("No patient folders found for dummy annotations.")
+                   dummy_data = [{'patient_id': pid, 'question': f'Dummy Q {pid}', 'answer': f'Dummy A {pid}', 'report': f'Dummy R {pid}'} for pid in patient_ids]
+                   pd.DataFrame(dummy_data).to_csv(args.annotations_path, index=False)
+                   print(f"Created dummy annotations for {len(patient_ids)} patients.")
+              except Exception as e: print(f"Failed to create dummy annotations: {e}"); exit()
+         else: print(f"Using existing dummy annotations at {args.annotations_path}")
+    elif not os.path.isfile(args.annotations_path):
+         raise FileNotFoundError(f"Annotations file not found at {args.annotations_path}. Please provide a valid path or omit the argument to create a dummy file.")
 
     return args
 
@@ -112,13 +125,13 @@ def train_neuroreport(config):
         data_module = NeuroReportDataModule(
             data_dir=config.data_dir, annotations_path=config.annotations_path,
             batch_size=config.batch_size, mode=config.mode, target_size=config.target_size,
-            # val_split=0.0, test_split=0.0, # No splits
+            val_split=config.val_split, test_split=config.test_split, # Use splits from config
             num_workers=config.num_workers,
             normalization=config.normalization, n_slices=config.n_slices,
             modalities=config.modalities
         )
         data_module.prepare_data()
-        data_module.setup(stage='fit') # Setup only training data
+        data_module.setup(stage='fit') # Setup train/val splits
         t_end.record(); torch.cuda.synchronize(); print(f"DataModule initialized ({t_end.elapsed_time(t_start)/1000:.2f}s).")
     except Exception as e: print(f"Error initializing DataModule: {e}"); return None, None
 
@@ -126,24 +139,19 @@ def train_neuroreport(config):
     if not data_module.train_dataloader():
          print("Error: Training dataloader is empty. Check data directory and dataset setup.")
          return None, None
+    if config.val_split > 0 and not data_module.val_dataloader():
+         print("Warning: Validation split > 0 but validation dataloader is empty.")
 
 
     # 2. Model
     print("Initializing NeuroReportModel..."); t_start.record()
     try:
-        # Model initialization (uses imported classes and config)
-        # Warmup steps calculation needs refinement without validation loop
-        try:
-             # Estimate steps based only on training dataloader
-             if hasattr(data_module, 'train_dataloader') and data_module.train_dataloader() is not None:
-                  steps_per_epoch = len(data_module.train_dataloader()) // config.accumulate_grad_batches
-                  total_steps = steps_per_epoch * config.max_epochs if config.max_epochs > 0 else 10000 # Estimate if max_epochs=-1
-                  warmup_steps = int(total_steps * config.warmup_steps_ratio)
-                  print(f"Warmup Steps Ratio: {config.warmup_steps_ratio}, Total Est. Steps: {total_steps} -> Warmup Steps: {warmup_steps}")
-             else: raise ValueError("Train dataloader not available for step estimation.")
-        except Exception as e_steps:
-             warmup_steps = 100 # Fallback warmup steps
-             print(f"Could not estimate total steps ({e_steps}). Using default warmup_steps: {warmup_steps}")
+        # Get tokenizer from DataModule (assuming it's loaded/created there or in Stage 5)
+        # In this setup, model needs tokenizer. We load it here or assume it's part of LanguageDecoder.
+        # Simplified: Re-load tokenizer here based on config (Ideally pass from Stage 5)
+        from transformers import AutoTokenizer
+        tokenizer_instance = AutoTokenizer.from_pretrained(config.language_model_name)
+        if tokenizer_instance.pad_token is None: tokenizer_instance.pad_token = tokenizer_instance.eos_token
 
         # Instantiate the main model class from Stage 6
         model = NeuroReportModel(
@@ -159,6 +167,8 @@ def train_neuroreport(config):
             mode=config.mode,
             warmup_steps_ratio=config.warmup_steps_ratio, # Pass ratio
             max_label_length=config.max_label_length,
+            tokenizer=tokenizer_instance, # Pass tokenizer to model
+            is_encoder_decoder_model=(config.language_model_type == 'seq2seq'), # Pass type flag
             # Add other args like target_size, n_slices, normalization if needed by model init
         )
         t_end.record(); torch.cuda.synchronize(); print(f"NeuroReportModel initialized ({t_end.elapsed_time(t_start)/1000:.2f}s).")
@@ -167,18 +177,26 @@ def train_neuroreport(config):
     # 3. Callbacks
     print("Initializing Callbacks..."); t_start.record()
     callbacks = []
-    # Checkpointing without validation metric - save based on epoch/step
+    # Re-enable checkpointing monitoring val_loss
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
         dirpath=config.checkpoint_dir,
-        filename=f"neuroreport-{config.mode}-{{epoch:02d}}-{{step}}", # Include step count
-        save_top_k=-1,       # Save all checkpoints or based on interval
-        every_n_epochs=1,    # Save checkpoint every epoch
+        filename=f"neuroreport-{config.mode}-{{epoch:02d}}-{{val_loss:.2f}}",
+        save_top_k=1,        # Save only the best model
+        monitor='val_loss',  # Monitor validation loss
+        mode='min',          # Minimize validation loss
         save_last=True )
     callbacks.append(checkpoint_callback)
     lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval="step")
     callbacks.append(lr_monitor)
-    # Remove EarlyStopping as it needs a validation metric
-    # if config.early_stopping_patience > 0: ...
+    # Re-enable EarlyStopping if patience > 0
+    if config.early_stopping_patience > 0:
+         early_stopping_callback = pl.callbacks.EarlyStopping(
+             monitor='val_loss',
+             patience=config.early_stopping_patience,
+             mode='min'
+         )
+         callbacks.append(early_stopping_callback)
+         print(f"Enabled EarlyStopping with patience {config.early_stopping_patience} on val_loss.")
     t_end.record(); torch.cuda.synchronize(); print(f"Callbacks initialized ({t_end.elapsed_time(t_start)/1000:.2f}s).")
 
     # 4. Trainer
@@ -202,48 +220,56 @@ def train_neuroreport(config):
         accumulate_grad_batches=config.accumulate_grad_batches,
         log_every_n_steps=config.log_every_n_steps,
         callbacks=callbacks,
-        # No validation loop: num_sanity_val_steps=0, check_val_every_n_epoch set high? or default PL behavior
-        num_sanity_val_steps=0, # Disable sanity check as there's no val loader
+        # Enable validation loop checking
+        check_val_every_n_epoch=1, # Check validation every epoch
+        num_sanity_val_steps=2, # Run sanity checks on val data
         # logger=... # Add logger (TensorBoard, WandB) here if needed
     )
 
     # Update total steps in model for scheduler *after* trainer init (more reliable)
-    if hasattr(trainer, 'estimated_stepping_batches') and trainer.estimated_stepping_batches:
-         # This might be None if validation loop is disabled, handle carefully
-         model.total_training_steps = trainer.estimated_stepping_batches
-         new_warmup = int(model.total_training_steps * config.warmup_steps_ratio)
-         if new_warmup != model.warmup_steps:
-              print(f"Revising warmup steps based on trainer estimate: {new_warmup}")
-              model.warmup_steps = new_warmup
-         print(f"Trainer estimated total steps: {model.total_training_steps}")
-    else:
-         # Fallback to manual estimation if trainer attribute not available
-         try:
-             train_loader = data_module.train_dataloader()
-             model.total_training_steps = len(train_loader) * config.max_epochs // config.accumulate_grad_batches
-             if model.total_training_steps <=0: model.total_training_steps = 1000 # Min fallback
+    # Needs adjustment since estimated_stepping_batches includes validation batches
+    try:
+         if hasattr(trainer, 'datamodule') and hasattr(trainer.datamodule, 'train_dataloader') and trainer.datamodule.train_dataloader() is not None:
+             num_train_batches = len(trainer.datamodule.train_dataloader())
+             accum_factor = getattr(trainer, 'accumulate_grad_batches', 1)
+             model.total_training_steps = (num_train_batches // accum_factor) * trainer.max_epochs
+             if model.total_training_steps <= 0: model.total_training_steps = 10000 # Fallback
              new_warmup = int(model.total_training_steps * config.warmup_steps_ratio)
-             print(f"Manually estimated total steps: {model.total_training_steps}. Revised warmup steps: {new_warmup}")
+             print(f"Estimated train steps per epoch: {num_train_batches // accum_factor}")
+             print(f"Total estimated training steps: {model.total_training_steps}. Revised warmup steps: {new_warmup}")
              model.warmup_steps = new_warmup
-         except Exception as e_est:
-             warnings.warn(f"Could not manually estimate total steps for scheduler ({e_est}). Using previous estimate.")
+         else: raise ValueError("Train dataloader not available for step estimation.")
+    except Exception as e_est:
+         warnings.warn(f"Could not manually estimate total steps for scheduler ({e_est}). Using previous estimate.")
 
 
     t_end.record(); torch.cuda.synchronize(); print(f"Trainer initialized ({t_end.elapsed_time(t_start)/1000:.2f}s).")
 
     # 5. Training
-    print("\n--- Starting Training (No Validation Loop) ---"); t_start.record()
+    print("\n--- Starting Training ---"); t_start.record()
     try:
-        # Pass only train dataloader
-        trainer.fit(model, train_dataloaders=data_module.train_dataloader())
+        # Pass datamodule to fit for train and val loaders
+        trainer.fit(model, datamodule=data_module)
         t_end.record(); torch.cuda.synchronize(); fit_time = t_end.elapsed_time(t_start)/1000
         print(f"--- Training Finished ({fit_time:.2f}s) ---")
     except Exception as e_fit: print(f"Error during training: {e_fit}"); import traceback; traceback.print_exc(); return None, None
 
-    # 6. Testing (Disabled)
+    # 6. Testing (Re-enabled)
     test_results = None
-    print("Skipping testing phase as no test split is configured.")
-    # if config.run_test_after_train: ... (Removed)
+    if config.run_test_after_train:
+         print("\n--- Starting Testing ---"); t_start.record()
+         # Setup test data
+         data_module.setup(stage='test')
+         if data_module.test_dataloader():
+              test_results = trainer.test(model, datamodule=data_module)
+              t_end.record(); torch.cuda.synchronize(); test_time = t_end.elapsed_time(t_start)/1000
+              print(f"--- Testing Finished ({test_time:.2f}s) ---")
+              print("Test Results:", test_results)
+         else:
+              print("Skipping testing: No test dataloader found.")
+    else:
+         print("Skipping testing as --run_test_after_train is not set.")
+
 
     return trainer, test_results
 
@@ -306,19 +332,14 @@ if __name__ == "__main__":
         # trainer.save_checkpoint(final_save_path)
         # print(f"Final model checkpoint saved to: {final_save_path}")
 
-        # Find the last checkpoint to mention it
-        last_ckpt_path = os.path.join(config.checkpoint_dir, 'last.ckpt')
-        if os.path.exists(last_ckpt_path):
-             print(f"Last checkpoint saved at: {last_ckpt_path}")
-        else: # Find latest checkpoint by modification time if last.ckpt missing
-             ckpt_files = glob.glob(os.path.join(config.checkpoint_dir, "*.ckpt"))
-             if ckpt_files:
-                 latest_ckpt = max(ckpt_files, key=os.path.getmtime)
-                 print(f"Latest checkpoint saved at: {latest_ckpt}")
+        # Find the best checkpoint to mention it
+        best_ckpt_path = trainer.checkpoint_callback.best_model_path
+        if best_ckpt_path and os.path.exists(best_ckpt_path):
+            print(f"Best checkpoint (based on val_loss) saved at: {best_ckpt_path}")
+        elif trainer.checkpoint_callback.last_model_path and os.path.exists(trainer.checkpoint_callback.last_model_path):
+            print(f"Last checkpoint saved at: {trainer.checkpoint_callback.last_model_path}")
+        else:
+             print("No checkpoint path found in callback.")
 
     else:
         print("\nTraining script failed or was interrupted.")
-
-```
-  </change>
-  <change>
